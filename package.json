@@ -32,7 +32,9 @@
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json",
-    "docs",
+    "docs/plugin-detail.en.md",
+    "docs/plugin-detail.zh.md",
+    "docs/preview.svg",
     "README.md",
     "README.en.md"
   ],
