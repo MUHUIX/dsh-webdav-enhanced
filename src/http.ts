@@ -1,12 +1,13 @@
 /*
- * HTTP 路由层（v2）：把 core 能力暴露给设置页前端（/api/webdav-enhanced/*）。
- * 只做「解析请求 → 调 HttpContext → 回 JSON」，不接触 cordis 运行时、不直接碰文件/网络，
- * 因此可以在纯 node 环境下用 mock 测试（host.test.ts）。
- *
- * 契约见 docs/DESIGN-v2.md §5：
- * - POST /sync 立即返回 {started, runId, alreadyRunning}，绝不 await 整轮；
- * - 所有失败响应 { error }（400/500）；
- * - /progress 空闲时 phase='idle' + report=上次报告。
+ * HTTP 路由层（v0.5）。
+ * 宿主 dsh-host-webserver 以 Node (req,res) 风格派发 handler（见其 index.js
+ * `responder.handler(req, res)`），v0.4 的 Node 传输契约是对的，保持。
+ * v0.5 变化（C-3）：
+ * - 所有请求先过 originAllowed()：拒绝跨源浏览器请求（CSRF）——裸 fetch 到
+ *   127.0.0.1:<port>/api/webdav-enhanced/* 的破坏性端点不再对任意本机页面敞开；
+ * - readJson 限 2 MiB（拒绝内存 DoS）；
+ * - POST /sync 透传 confirmBulkDelete（批量删除护栏）。
+ * 只做「解析请求 → 调 HttpContext → 回 JSON」，不接触 cordis 运行时。
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type {
@@ -31,17 +32,22 @@ export interface StartSyncResult {
   started: boolean
   runId: string
   alreadyRunning: boolean
+  /** 本轮存在被批量删除护栏阻断的条目（客户端据此弹确认） */
+  bulkGuarded?: boolean
 }
 
-export interface ItemInfo {
-  name: string
-  version: string | null
-  kind: EntryKind
-  hash: string
-  sizeBytes: number
-  modifiedAt: string
-  /** kind=config 时附带：可勾选的顶层 key 列表（不含敏感 key，供「内容」页做勾选） */
-  keys?: string[]
+/** 请求体上限：2 MiB */
+export const MAX_BODY_BYTES = 2 * 1024 * 1024
+
+/** 错误原文脱敏（v0.5，L-4）：URL 内嵌凭据与 password/token 参数不进 UI 与日志 */
+const REDACT_PATTERNS: Array<[RegExp, string]> = [
+  [/(:\/\/[^\s/@]+:)[^\s@/]+@/g, '$1***@'],
+  [/((?:password|passwd|token|secret|api[-_]?key)["']?\s*[:=]\s*)["']?[^\s"',}&]+/gi, '$1***'],
+]
+export function redactSecrets(text: string): string {
+  let out = text
+  for (const [re, repl] of REDACT_PATTERNS) out = out.replace(re, repl)
+  return out
 }
 
 /** host 注入的业务能力（全部由 host.ts 实现，http.ts 只转发） */
@@ -53,7 +59,7 @@ export interface HttpContext {
   status(): Promise<StatusPayload>
   progress(): RunProgress
   plan(): Promise<PlanResult>
-  startSync(trigger?: SyncTrigger): StartSyncResult
+  startSync(trigger?: SyncTrigger, opts?: { confirmBulkDelete?: boolean }): StartSyncResult
   cancelSync(): { cancelled: boolean }
   logs(query: LogQuery): { entries: LogEntry[]; total: number }
   reprobe(profile?: string): Promise<ResolvedEnv>
@@ -63,7 +69,7 @@ export interface HttpContext {
   runSync(): Promise<SyncRunReport>
 }
 
-/** dsh webServer 服务的最小契约（与 @deepseek-ai/dsh-host-webserver 对齐） */
+/** dsh webServer 服务的最小契约（与 @deepseek-ai/dsh-host-webserver 对齐：Node req/res） */
 export interface WebServerLike {
   register(route: {
     kind: 'exact' | 'prefix'
@@ -72,13 +78,42 @@ export interface WebServerLike {
   }): () => void
 }
 
+/**
+ * 来源守卫（C-3）。宿主 webServer 文档明示「路由拥有者自理请求策略」，
+ * 且路由级 handler 拿不到 PeerScope，故以浏览器头自证同源：
+ * - 带 Sec-Fetch-Site：非 same-origin/none 一律拒；
+ * - 带 Origin：host 必须与请求 Host 一致；
+ * - 无 Origin 的非浏览器客户端（本机 CLI/测试）放行——能直连回环端口的进程
+ *   本就具备用户权限，这一层拦的是浏览器里的第三方页面。
+ */
+export function originAllowed(req: Pick<IncomingMessage, 'headers'>): boolean {
+  const headers = req.headers ?? ({} as IncomingMessage['headers'])
+  const host = String(headers.host ?? '').toLowerCase()
+  const site = headers['sec-fetch-site']
+  if (typeof site === 'string' && site && !['same-origin', 'none'].includes(site.toLowerCase())) return false
+  const origin = headers.origin
+  if (typeof origin === 'string' && origin !== '') {
+    try {
+      if (new URL(origin).host.toLowerCase() !== host) return false
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
 export function registerHttpRoutes(webServer: WebServerLike, ctx: HttpContext): () => void {
   return webServer.register({
     kind: 'prefix',
     path: HTTP_PREFIX,
     handler: (req, res) => {
+      if (!originAllowed(req)) {
+        sendJson(res, 403, { error: 'cross-origin request denied' })
+        return
+      }
       void handle(req, res, ctx).catch((err: unknown) => {
-        sendJson(res, 500, { error: (err as Error).message })
+        if (!res.headersSent) sendJson(res, 500, { error: redactSecrets((err as Error).message) })
+        else res.end()
       })
     },
   })
@@ -92,7 +127,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: HttpContex
     const payload = await dispatch(route, method, req, url, ctx)
     sendJson(res, 200, payload)
   } catch (err) {
-    sendJson(res, 400, { error: (err as Error).message })
+    sendJson(res, 400, { error: redactSecrets((err as Error).message) })
   }
 }
 
@@ -109,7 +144,12 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
+  let size = 0
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length
+    if (size > MAX_BODY_BYTES) throw new Error('请求体过大（>2MiB）')
+    chunks.push(chunk as Buffer)
+  }
   const text = Buffer.concat(chunks).toString('utf8').trim()
   if (!text) return {}
   const parsed = JSON.parse(text) as unknown
@@ -176,10 +216,12 @@ async function dispatch(
       requireGet(method, '/plan')
       return ctx.plan()
 
-    case '/sync':
+    case '/sync': {
       requirePost(method, '/sync')
       // 立即返回，绝不 await 整轮（DESIGN-v2 §5 并发约束）
-      return ctx.startSync('manual')
+      const body = await readJson(req).catch(() => ({}) as Record<string, unknown>)
+      return ctx.startSync('manual', { confirmBulkDelete: body.confirmBulkDelete === true })
+    }
 
     case '/cancel':
       requirePost(method, '/cancel')
@@ -207,4 +249,15 @@ async function dispatch(
     default:
       throw new Error(`unknown route: ${route}`)
   }
+}
+
+export interface ItemInfo {
+  name: string
+  version: string | null
+  kind: EntryKind
+  hash: string
+  sizeBytes: number
+  modifiedAt: string
+  /** kind=config 时附带：可勾选的顶层 key 列表（不含敏感 key，供「内容」页做勾选） */
+  keys?: string[]
 }

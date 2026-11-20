@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/dsh-webdav-enhanced?color=4a7dff)](https://www.npmjs.com/package/dsh-webdav-enhanced)
 [![npm downloads](https://img.shields.io/npm/dm/dsh-webdav-enhanced)](https://www.npmjs.com/package/dsh-webdav-enhanced)
-[![GitHub stars](https://img.shields.io/github/stars/HUIdada1/dsh-webdav-enhanced?style=social)](https://github.com/HUIdada1/dsh-webdav-enhanced)
+[![GitHub stars](https://img.shields.io/github/stars/MUHUIX/dsh-webdav-enhanced?style=social)](https://github.com/MUHUIX/dsh-webdav-enhanced)
 [![license](https://img.shields.io/npm/l/dsh-webdav-enhanced)](./LICENSE)
 [![node](https://img.shields.io/node/v/dsh-webdav-enhanced)](./package.json)
 [![DeepSeek Harness plugin](https://img.shields.io/badge/DeepSeek%20Harness-plugin-4a7dff)](https://www.npmjs.com/package/@deepseek-ai/dsh)
@@ -18,13 +18,13 @@
 | 能力 | 说明 |
 | --- | --- |
 | **同步插件** | profile 里的 bundle 打包上传，其他机器下载后自动安装 |
-| **同步技能** | `$DSH_HOME/skills` 下的技能目录整包同步，装一次到处可用 |
-| **同步模型配置** | `settings.yaml` 顶层 key 按 key 合并同步，默认关闭 |
+| **同步技能** | 宿主实际扫描的技能根（`$DSH_HOME/skills`、`~/.agents/skills`、`~/.claude/skills`）下的技能目录整包同步，装一次到处可用 |
+| **同步模型配置** | `settings.yaml` 顶层 key 按 key 合并同步，默认关闭；仅对存在 `settings.yaml` 的布局生效（桌面版 0.2.x 无此文件，此时该能力自动停用并在诊断页如实显示） |
 | **双向 / 单向** | 每台机器可独立选择双向、仅上传、仅下载 |
-| **内容寻址去重** | 内容 SHA-256 寻址，同内容只传一次；远端已有同内容文件时跨条目复用，不重复上传 |
+| **内容寻址存储** | 目录内容与 zip 本体各算一份 SHA-256：同一条目重传命中远端已有文件时复用；下载后先校验 zip 哈希、再复核内容 hash，任一不符拒绝安装 |
 | **三路智能合并** | base 取上次同步快照，只有两端都改过才算分叉；分叉按修改时间、再按版本号裁决赢家，输家自动备份 |
 | **默认全自动** | 分叉自动裁决、下载即安装、删除自动传播、定时开关保存即生效，不需要人工处理冲突 |
-| **删除传播** | 一端删除，另一端跟随：远端进 `trash/`，本地先备份 |
+| **删除传播** | 一端删除，另一端跟随：远端进 `trash/`，本地先备份；单轮删除量异常时由批量护栏整批阻断待确认 |
 | **实时进度** | 阶段 + 百分比 + 上传/下载/合并/跳过/删除计数 + 当前条目，运行中随时取消 |
 | **结构化日志** | 按级别与分类（上传/下载/合并/跳过/删除/去重/冲突/连接/调度/环境）落盘 JSONL，界面可筛选、搜索、导出 |
 | **干跑分析** | 同步前先看差异清单（每个条目要上传、下载、合并还是跳过），只读不写 |
@@ -87,7 +87,7 @@ dsh plugin --profile desktop add link:/path/to/dsh-webdav-enhanced
 | --- | --- | --- |
 | `profile` | 自动探测 | 要同步的 dsh profile 名。留空时按「哪个 profile 装了本插件」判定，桌面版得 `desktop`、Web 版得 `web` |
 | `connection.url` / `connection.username` | 空 | 也可在设置页填写 |
-| `connection.password` | 空 | 仅作首次迁移来源；之后以本地凭据文件为准 |
+| `connection.password` | — | v0.5 起 cordis 配置不再接受密码字段；只在设置页填写，存本机凭据文件 |
 | `options.timeoutMs` | `30000` | 单次 WebDAV 请求超时（毫秒） |
 | `options.remoteRoot` | `/dsh-sync/` | 远端同步根目录 |
 | `options.ignoreTlsErrors` | `false` | 仅内网自签证书场景开启 |
@@ -101,13 +101,14 @@ dsh plugin --profile desktop add link:/path/to/dsh-webdav-enhanced
 | `syncOptions.maxBackups` | `10` | 每类条目保留的本地备份份数，超出删除最旧 |
 | `syncOptions.pruneTombstones` | `true` | 同步结束后清理远端 tombstone 与超期 trash |
 | `syncOptions.hardDelete` | `false` | 是否在结束后物理删除远端 tombstone（默认只清 trash） |
+| `syncOptions.bulkDeleteGuard` | `true` | 批量删除护栏：单轮 delete-local 超过 3 条且超过远端存活数 30% 时整批阻断，需在界面确认后重跑 |
 | `scope.*` | 插件 + 技能 `all`，配置 `none` | 同步范围 |
 
 ## 同步范围
 
-- **插件**：profile `package.json` 依赖里带 `dsh.bundle` 标记的条目，按本地路径打包。
-- **技能**：`$DSH_HOME/skills` 下每个含 `SKILL.md` 的目录，连内部文件一起同步。
-- **配置**：`settings.yaml` 的顶层 key，可用 `includeKeys` 精确指定。`.credentials.yaml` 永不参与，`apiKey`、`credentials` 等敏感顶层 key 同样永不参与。
+- **插件**：profile `package.json` 依赖里带 `dsh.bundle` 标记、或列在 `dsh.profile.bundles` 里的条目，按本地路径打包；link 安装的目录视为开发工作区，只上传、不会被删除传播搬走。
+- **技能**：按宿主实际扫描的多个根目录（`$DSH_HOME/skills`、`~/.agents/skills`、`~/.claude/skills`，按存在性取用、realpath 去重）中每个含 `SKILL.md` 的目录，连内部文件一起同步；新下载的条目落到第一个现存根。
+- **配置**：`settings.yaml` 的顶层 key，可用 `includeKeys` 精确指定。`.credentials.yaml` 永不参与；`apiKey` 等敏感顶层 key 整段跳过，保留块内的敏感字段行（`apiKey:`、`token:` 等）逐行剔除并计数告警。
 
 配置模式选「全部」时同步所有非敏感顶层 key；选「指定」时只动 `includeKeys` 列出的 key。
 
@@ -135,15 +136,20 @@ v0.4.0 起默认策略是 `auto`：两端都改过才算分叉，分叉时自动
 | **坚果云** | 可用，需在账号设置里开启 WebDAV 并使用应用密码；有频率限制，建议间隔 ≥ 1 小时 |
 | **群晖 Synology** | 安装 WebDAV Server 套件后完整支持 |
 | **AList** | 完整支持，任意存储驱动 |
-| **自建服务** | 任意 RFC 4918 实现；不支持 LOCK / If-Match 时自动降级为软锁与冲突副本 |
+| **自建服务** | 任意 RFC 4918 实现；不支持 LOCK 时自动降级为软锁，不支持 If-Match 时提交后回读校验，检测到覆盖冲突自动重试 |
 
 ## 安全
 
-- **API Key 默认不同步**：`.credentials.yaml` 永不参与；`settings.yaml` 里的 `apiKey` 等敏感顶层 key 永不参与；配置同步默认关闭。
-- **密码不出本机**：WebDAV 密码写在 `$DSH_HOME/.webdav-enhanced/credentials.json`（权限 0600），既不进 cordis 配置，也不上传远端；接口返回的配置里永远不含密码。
-- **完整性校验**：所有 zip 按 SHA-256 内容寻址，下载后逐份校验。
-- **删除有兜底**：远端删除进 `trash/` 保留 7 天，本地删除前先备份，误删可从两处找回。
-- **解压防护**：拒绝路径穿越与 zip 炸弹，单文件 128MB、总量 512MB 上限。
+v0.5 把安全边界作为首要修复目标，以下承诺与实现逐条对应：
+
+- **API Key 默认不同步**：`.credentials.yaml` 永不参与；`settings.yaml` 里 `apiKey` 等敏感顶层 key 整段跳过；保留块内的 `apiKey:`/`token:` 等字段行也会被逐行剔除，剔除数量在日志中如实告警。
+- **密码不出本机**：WebDAV 密码只写 `$DSH_HOME/.webdav-enhanced/credentials.json`（原子写；0600 权限仅在 POSIX 生效，Windows 依赖用户目录 ACL——建议配应用专用密码），不进 cordis 配置、不上传远端；接口返回的配置里永远不含密码。
+- **远端数据全部视为不可信**：清单条目逐条结构校验（name/hash/file 越界即丢弃并告警）；包内 `_meta` 与清单身份交叉核对；所有落盘路径 resolve 后断言在管理根内。
+- **下载完整性**：zip 本体按 SHA-256 校验，解包后目录再按内容 hash 复核，任一不符拒绝安装。
+- **删除有兜底**：远端删除进 `trash/` 保留 7 天（按落站时间戳判定，判不了龄就保留）；本地删除前先备份；单轮批量删除超阈值时整批阻断待确认。
+- **link 工作区保护**：不在 profile/skills 管理范围内的目录（如 `link:` 指向的源码工程）永不被删除传播搬走。
+- **设置页 API 仅同源可达**：`/api/webdav-enhanced/*` 校验 `Origin`/`Sec-Fetch-Site`，浏览器里的第三方页面打不进来；请求体限 2 MiB。
+- **传输超时兑现**：`timeoutMs` 对每次 WebDAV 请求生效（AbortSignal），不会因单次挂起卡死整条同步链。
 
 ## 远端目录结构
 

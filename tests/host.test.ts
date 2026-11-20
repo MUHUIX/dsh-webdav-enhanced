@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { apply, Config, name } from '../src/host.js'
+import { apply, Config, inject, name } from '../src/host.js'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -15,13 +15,15 @@ interface CapturedRoute {
 
 interface CapturedTool {
   name: string
-  execute: () => Promise<unknown>
+  output: { schema: unknown; render?: unknown }
+  execute: (args?: unknown) => Promise<unknown>
 }
 
 /**
- * 最小 host ctx：模拟 cordis 的服务注入。
- * 真实 cordis 里直接读 ctx.webServer 会抛 "cannot get property without inject"，
- * 所以 apply() 必须先 inject 再在回调里访问。
+ * 最小 host ctx：模拟 cordis 生命周期。
+ * - webServer / tools 经模块级 inject 静态注入，可直接读；
+ * - effect(fn) 立即执行 fn 并收集其返回的 disposer（卸载时调用）；
+ * - pluginManager 走 ctx.inject 动态申请。
  */
 function makeCtx() {
   const routes: CapturedRoute[] = []
@@ -29,8 +31,14 @@ function makeCtx() {
   const handlers: CapturedTool[] = []
   const events: string[] = []
   const injected: string[] = []
+  const effectLabels: string[] = []
+  const disposers: Array<() => void> = []
 
-  const services = {
+  const services: {
+    webServer: { register: (route: CapturedRoute) => () => void }
+    tools: { register: (tool: CapturedTool) => () => void }
+    pluginManager?: { installBundle: (spec: string) => Promise<unknown> }
+  } = {
     webServer: {
       register: (route: CapturedRoute) => {
         routes.push(route)
@@ -41,21 +49,30 @@ function makeCtx() {
       register: (tool: CapturedTool) => {
         tools.push(tool.name)
         handlers.push(tool)
+        return () => undefined
       },
     },
   }
 
   const ctx = {
+    webServer: services.webServer,
+    tools: services.tools,
     inject: (names: string[], callback: (s: typeof services) => void) => {
       injected.push(...names)
       callback(services)
+    },
+    effect: (fn: () => (() => void) | void, label?: string) => {
+      effectLabels.push(label ?? '')
+      const dispose = fn()
+      if (typeof dispose === 'function') disposers.push(dispose)
+      return dispose
     },
     on: (event: string) => {
       events.push(event)
     },
   }
 
-  return { routes, tools, handlers, events, injected, ctx }
+  return { ctx, services, routes, tools, handlers, events, injected, effectLabels, disposers }
 }
 
 describe('host', () => {
@@ -85,11 +102,21 @@ describe('host', () => {
     expect(cfg.scope.configs.mode).toBe('none')
   })
 
-  it('apply() declares the services it touches via inject', () => {
+  it('declares webServer/tools as static inject and registers via ctx.effect', () => {
+    expect(Array.isArray(inject)).toBe(true)
+    expect(inject).toContain('webServer')
+    expect(inject).toContain('tools')
+    const { ctx, effectLabels } = makeCtx()
+    apply(ctx, Config({}))
+    // H-15：注册必须在 ctx.effect 生命周期内，而不是依赖 'dispose' 事件
+    expect(effectLabels.some((l) => l.includes('http-routes'))).toBe(true)
+    expect(effectLabels.some((l) => l.includes('agent-tools'))).toBe(true)
+  })
+
+  it('applies for pluginManager dynamically (bundle install without shell)', () => {
     const { ctx, injected } = makeCtx()
     apply(ctx, Config({}))
-    expect(injected).toContain('webServer')
-    expect(injected).toContain('tools')
+    expect(injected).toContain('pluginManager')
   })
 
   it('apply() registers the settings-page HTTP route', () => {
@@ -101,16 +128,23 @@ describe('host', () => {
     expect(typeof routes[0].handler).toBe('function')
   })
 
-  it('apply() registers both agent tools', () => {
-    const { ctx, tools } = makeCtx()
+  it('apply() registers both agent tools with output.render (H-1 regression)', () => {
+    const { ctx, tools, handlers } = makeCtx()
     apply(ctx, Config({}))
     expect(tools).toEqual(['webdav_sync_status', 'webdav_sync_now'])
+    // 宿主 ToolsService.register 强制 output.render 是函数——缺一个都算回归
+    for (const t of handlers) {
+      expect(t.output).toBeDefined()
+      expect(typeof t.output.render).toBe('function')
+      expect(t.output.schema).toBeDefined()
+    }
   })
 
-  it('apply() subscribes to dispose for cleanup', () => {
-    const { ctx, events } = makeCtx()
+  it('effect disposers unregister without throwing', () => {
+    const { ctx, disposers } = makeCtx()
     apply(ctx, Config({}))
-    expect(events).toContain('dispose')
+    expect(disposers.length).toBeGreaterThan(0)
+    for (const d of disposers) expect(() => d()).not.toThrow()
   })
 
   it('does not wipe what the settings page saved when cordis config is default', async () => {

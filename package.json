@@ -1,9 +1,8 @@
 {
   "name": "dsh-webdav-enhanced",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "WebDAV sync plugin for DeepSeek Harness: sync plugins, skills and model/provider configs across machines, with automatic merge, content dedupe, live progress and categorized logs.",
   "type": "module",
-  "main": "lib/host.js",
   "types": "lib/host.d.ts",
   "icon": "./icon.svg",
   "exports": {
@@ -33,7 +32,7 @@
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json",
-    "docs/plugin-detail.*.md",
+    "docs",
     "README.md",
     "README.en.md"
   ],
@@ -45,7 +44,8 @@
     "prepublishOnly": "npm run build"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24.9",
+    "dsh": ">=0.2.2 <1"
   },
   "dependencies": {
     "archiver": "^7.0.1",
@@ -58,8 +58,7 @@
     "@types/node": "^22.10.0",
     "@types/unzipper": "^0.10.11",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.8",
-    "webdav-server": "^2.6.3"
+    "vitest": "^2.1.8"
   },
   "license": "MIT",
   "publishConfig": {
@@ -68,9 +67,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/HUIdada1/dsh-webdav-enhanced.git"
+    "url": "https://github.com/MUHUIX/dsh-webdav-enhanced.git"
   },
-  "author": "HUIdada1",
+  "author": "MUHUIX",
   "keywords": [
     "deepseek",
     "deepseek-harness",

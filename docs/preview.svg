@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 400" width="960" height="400" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0f1626"/>
+      <stop offset="1" stop-color="#131c31"/>
+    </linearGradient>
+    <linearGradient id="srv" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4a7dff"/>
+      <stop offset="1" stop-color="#3358c4"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#6f8fff"/>
+    </marker>
+  </defs>
+  <rect width="960" height="400" rx="18" fill="url(#bg)"/>
+  <text x="40" y="56" fill="#e8edf8" font-size="26" font-weight="700">一台配好，其余机器自动跟上</text>
+  <text x="40" y="86" fill="#9fb0d0" font-size="15">插件 · 技能 · 模型配置，经由你自己的 WebDAV 服务器在三台机器间对齐</text>
+
+  <!-- machines -->
+  <g>
+    <rect x="40" y="140" width="200" height="86" rx="12" fill="#1b2740" stroke="#2c3d61"/>
+    <rect x="64" y="160" width="34" height="24" rx="4" fill="none" stroke="#6f8fff" stroke-width="2"/>
+    <path d="M56 192 h50" stroke="#6f8fff" stroke-width="2"/>
+    <text x="112" y="176" fill="#dce5f7" font-size="15" font-weight="600">工作机</text>
+    <text x="112" y="198" fill="#8fa2c6" font-size="12">上传新增 / 变更</text>
+
+    <rect x="40" y="244" width="200" height="86" rx="12" fill="#1b2740" stroke="#2c3d61"/>
+    <rect x="64" y="264" width="34" height="24" rx="4" fill="none" stroke="#6f8fff" stroke-width="2"/>
+    <path d="M56 296 h50" stroke="#6f8fff" stroke-width="2"/>
+    <text x="112" y="280" fill="#dce5f7" font-size="15" font-weight="600">家用机</text>
+    <text x="112" y="302" fill="#8fa2c6" font-size="12">下载并自动安装</text>
+
+    <rect x="40" y="348" width="200" height="34" rx="10" fill="#16213a" stroke="#26355a"/>
+    <text x="60" y="370" fill="#7d90b8" font-size="13">冲突？自动裁决，输家备份</text>
+  </g>
+
+  <!-- server -->
+  <g>
+    <rect x="700" y="150" width="220" height="180" rx="14" fill="url(#srv)"/>
+    <text x="736" y="192" fill="#ffffff" font-size="18" font-weight="700">WebDAV 服务器</text>
+    <text x="736" y="216" fill="#dbe6ff" font-size="13">Nextcloud · 坚果云 · 群晖</text>
+    <text x="736" y="236" fill="#dbe6ff" font-size="13">AList · 任意 RFC 4918</text>
+    <rect x="724" y="254" width="172" height="26" rx="6" fill="#24408f"/>
+    <text x="736" y="272" fill="#cddcff" font-size="13">manifest.json 全局账本</text>
+    <rect x="724" y="288" width="172" height="26" rx="6" fill="#24408f"/>
+    <text x="736" y="306" fill="#cddcff" font-size="13">bundles · skills · trash</text>
+  </g>
+
+  <!-- arrows -->
+  <path d="M248 183 C 420 150, 560 160, 692 196" fill="none" stroke="#6f8fff" stroke-width="2.5" marker-end="url(#arr)"/>
+  <path d="M692 268 C 560 300, 420 300, 248 287" fill="none" stroke="#6f8fff" stroke-width="2.5" marker-end="url(#arr)"/>
+  <text x="405" y="146" fill="#9fb0d0" font-size="13">SHA-256 内容寻址上传</text>
+  <text x="392" y="322" fill="#9fb0d0" font-size="13">下载校验后安装（可关）</text>
+
+  <!-- chips -->
+  <g font-size="13" fill="#cdd8f2">
+    <rect x="330" y="352" width="92" height="26" rx="13" fill="#1b2740" stroke="#2c3d61"/>
+    <text x="346" y="370">实时进度</text>
+    <rect x="432" y="352" width="92" height="26" rx="13" fill="#1b2740" stroke="#2c3d61"/>
+    <text x="448" y="370">分类日志</text>
+    <rect x="534" y="352" width="106" height="26" rx="13" fill="#1b2740" stroke="#2c3d61"/>
+    <text x="550" y="370">干跑分析</text>
+    <rect x="650" y="352" width="106" height="26" rx="13" fill="#1b2740" stroke="#2c3d61"/>
+    <text x="666" y="370">批量删护栏</text>
+    <rect x="766" y="352" width="106" height="26" rx="13" fill="#1b2740" stroke="#2c3d61"/>
+    <text x="782" y="370">密码不出本机</text>
+  </g>
+</svg>

@@ -210,7 +210,7 @@ describe('decideV2 决策表', () => {
     expect(d[0].backupHint).toBeTruthy()
   })
 
-  it('分叉 policy=local-wins → upload；remote-wins → download；merge-backup → download', () => {
+  it('分叉所有选边策略统一走 merge（赢家胜、输家备份，v0.5 H-4）', () => {
     const build = (policy: MergeInputV2['policy']) =>
       decideV2(
         mkInputV2({
@@ -220,11 +220,14 @@ describe('decideV2 决策表', () => {
           policy,
         }),
       )[0]
-    expect(build('local-wins').action).toBe('upload')
+    expect(build('local-wins').action).toBe('merge')
     expect(build('local-wins').winner).toBe('local')
-    expect(build('remote-wins').action).toBe('download')
+    expect(build('remote-wins').action).toBe('merge')
     expect(build('remote-wins').winner).toBe('remote')
-    expect(build('merge-backup').action).toBe('download')
+    expect(build('merge-backup').action).toBe('merge')
+    expect(build('merge-backup').winner).toBe('remote')
+    // reason 里宣称的"已备份"现在与执行路径一致：merge 是唯一做备份的 action
+    expect(build('merge-backup').reason).toContain('已备份')
   })
 
   it('分叉 policy=auto + autoResolve=manual → conflict', () => {

@@ -25,12 +25,16 @@ function writeConfig(data: unknown): void {
 }
 
 describe('ConfigStore v2 默认值', () => {
-  it('新配置：conflictPolicy=auto、syncOptions 全默认、lastSynced 为空', () => {
+  it('新配置：conflictPolicy=auto、syncOptions 全默认、lastSynced 为空；load 无写副作用', () => {
     const cfg = new ConfigStore(home).load()
     expect(cfg.conflictPolicy).toBe('auto')
     expect(cfg.syncOptions).toEqual(DEFAULT_SYNC_OPTIONS)
     expect(cfg.lastSynced).toEqual({})
     expect(cfg.lastSyncAt).toBeNull()
+    // v0.5（M-9）：load() 只读——干跑 /plan 不再因为一次 load 就把默认配置落盘
+    expect(existsSync(configFile())).toBe(false)
+    // 首次持久化写盘由显式 update/save 完成
+    new ConfigStore(home).update({ machineId: cfg.machineId })
     expect(existsSync(configFile())).toBe(true)
   })
 

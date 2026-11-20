@@ -5,7 +5,7 @@
  * - 引擎单例（连接配置变化才重建）+ 全局互斥（D5）；调度器随配置保存启停（D4）。
  * - 持有 ConfigStore / CredentialStore / RunLogger / RunProgressTracker 生命周期；卸载时清理定时器。
  */
-import { readFileSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -21,7 +21,7 @@ import { countsFromReport, generateRunId, RunProgressTracker } from './core/prog
 import { scanLocal, HashCache, listConfigTopKeys } from './core/scan.js'
 import { applyDirection, decideV2, filterByScope } from './core/merge.js'
 import { emptyManifest } from './core/manifest.js'
-import { registerHttpRoutes, type HttpContext, type ItemInfo, type StartSyncResult, type WebServerLike } from './http.js'
+import { registerHttpRoutes, redactSecrets, HTTP_PREFIX, type HttpContext, type ItemInfo, type StartSyncResult, type WebServerLike } from './http.js'
 import {
   DEFAULT_SYNC_OPTIONS,
   type ConflictPolicy,
@@ -51,6 +51,10 @@ import {
 
 export const name = 'webdav-enhanced'
 
+// 静态服务依赖（host-plugin.md 形态）：缺任一服务的组合里插件不激活，
+// 而不是运行时半挂。pluginManager 走动态 ctx.inject，保持可选。
+export const inject = ['webServer', 'tools']
+
 /** 远端同步根目录（与 README 的目录布局一致） */
 const REMOTE_ROOT = '/dsh-sync/'
 
@@ -66,8 +70,6 @@ export interface Config {
   connection: {
     url: string
     username: string
-    password: string
-    passwordRef: 'keychain' | 'credentials'
   }
   options: {
     timeoutMs: number
@@ -91,8 +93,6 @@ export const Config = Schema.object({
   connection: Schema.object({
     url: Schema.string().default(''),
     username: Schema.string().default(''),
-    password: Schema.string().default(''),
-    passwordRef: Schema.union(['keychain', 'credentials'] as const).default('credentials'),
   }),
   options: Schema.object({
     timeoutMs: Schema.number().default(30000),
@@ -128,8 +128,9 @@ export const Config = Schema.object({
     maxBackups: Schema.number().default(DEFAULT_SYNC_OPTIONS.maxBackups),
     pruneTombstones: Schema.boolean().default(DEFAULT_SYNC_OPTIONS.pruneTombstones),
     hardDelete: Schema.boolean().default(DEFAULT_SYNC_OPTIONS.hardDelete),
+    bulkDeleteGuard: Schema.boolean().default(DEFAULT_SYNC_OPTIONS.bulkDeleteGuard),
   }),
-  machineId: Schema.string().default(generateMachineId()),
+  machineId: Schema.string().default(''),
   profile: Schema.string().default(''),
 })
 
@@ -137,20 +138,29 @@ interface ToolRegistration {
   name: string
   description: string
   parameters: Record<string, unknown>
-  output: { schema: Record<string, unknown> }
-  execute: () => Promise<unknown>
+  output: { schema: Record<string, unknown>; render: (args: unknown, value: unknown) => unknown }
+  execute: (args: unknown) => Promise<unknown>
 }
 
-/** cordis 服务容器：只有经过 ctx.inject 声明后才能访问 */
+/** cordis 服务容器（动态 ctx.inject 回调侧）：只有声明过的服务才能访问 */
 interface ServiceCtx {
-  tools?: { register(tool: ToolRegistration): void }
+  tools?: { register(tool: ToolRegistration): () => void }
   webServer?: WebServerLike
+  /** 宿主插件管理服务：bundle 自动安装的正道（C-2：不再 shell 调 CLI） */
+  pluginManager?: {
+    installBundle(spec: string, options?: Record<string, unknown>): Promise<unknown>
+  }
 }
 
 /** dsh 宿主 ctx 的最小契约 */
 interface HostCtx {
-  /** cordis 服务注入：访问服务前必须声明，否则抛 "cannot get property without inject" */
+  /** 静态 inject（webServer/tools）声明后可直接访问 */
+  webServer?: WebServerLike
+  tools?: { register(tool: ToolRegistration): () => void }
+  /** cordis 动态注入：可选服务（pluginManager 在缺它的组合里保持惰性） */
   inject(services: string[], callback: (ctx: ServiceCtx) => void): void
+  /** cordis 生命周期：fn 的返回清理函数随插件 fiber 卸载回收（H-15） */
+  effect(fn: () => (() => void) | void, label?: string): unknown
   on?(event: string, fn: () => void): void
 }
 
@@ -198,12 +208,14 @@ function isObj(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
+/** 本地 profile 名白名单（v0.5，C-2 纵深防御）：显式指定 profile 只允许安全字符 */
+const PROFILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
 function mergeConnection(cur: PluginConnectionConfig, raw: unknown): PluginConnectionConfig | null {
   if (!isObj(raw)) return null
-  const next = { ...cur }
+  const next: PluginConnectionConfig = { ...cur }
   if (typeof raw.url === 'string') next.url = raw.url
   if (typeof raw.username === 'string') next.username = raw.username
-  if (raw.passwordRef === 'keychain' || raw.passwordRef === 'credentials') next.passwordRef = raw.passwordRef
   return next
 }
 
@@ -264,7 +276,7 @@ function mergeScope(cur: SyncScope, raw: unknown): SyncScope | null {
 function mergeSyncOptions(cur: SyncOptions, raw: unknown): SyncOptions | null {
   if (!isObj(raw)) return null
   const next: SyncOptions = { ...cur }
-  for (const key of ['propagateDeletions', 'dedupeRemote', 'autoInstall', 'contentMerge', 'pruneTombstones', 'hardDelete'] as const) {
+  for (const key of ['propagateDeletions', 'dedupeRemote', 'autoInstall', 'contentMerge', 'pruneTombstones', 'hardDelete', 'bulkDeleteGuard'] as const) {
     if (typeof raw[key] === 'boolean') next[key] = raw[key] as boolean
   }
   if (typeof raw.autoResolve === 'string' && (AUTO_RESOLVE as string[]).includes(raw.autoResolve)) {
@@ -284,7 +296,8 @@ export function apply(ctx: unknown, config: Config) {
     env: null,
     engine: null,
     engineSig: null,
-    password: config.connection.password,
+    // v0.5：密码只从本地凭据文件初始化——cordis 配置侧已不再接受 password 字段
+    password: '',
     logger: null,
     progress: new RunProgressTracker(),
     capabilities: null,
@@ -295,9 +308,14 @@ export function apply(ctx: unknown, config: Config) {
   }
 
   let initPromise: Promise<void> | null = null
+  /** 宿主 pluginManager 注入的 bundle 安装入口；不可用时保持 null（落 manual-needed） */
+  let installBundleDir: ((dir: string) => Promise<{ ok: boolean; message?: string }>) | null = null
 
   function log(level: LogLevel, category: LogCategory, message: string, extra?: { name?: string; runId?: string; detail?: string }): void {
-    runtime.logger?.log(level, category, message, extra)
+    runtime.logger?.log(level, category, redactSecrets(message), extra && {
+      ...extra,
+      ...(extra.detail ? { detail: redactSecrets(extra.detail) } : {}),
+    })
   }
 
   // ---------- 初始化 ----------
@@ -315,49 +333,30 @@ export function apply(ctx: unknown, config: Config) {
     const creds = new CredentialStore(dshHome)
     const logger = new RunLogger(dshHome)
 
-    // 本地凭据文件优先；首次运行把 cordis 配置里的明文密码迁移过去
-    const stored = creds.read()
-    if (!stored && config.connection.password) creds.write(config.connection.password)
-    runtime.password = stored || config.connection.password
+    // 密码永远只在本地凭据文件；读损坏时如实告警而不是静默"没配过"（M-9）
+    runtime.password = creds.read()
+    if (creds.lastError) logger.warn('system', `凭据文件读取失败（按未配置处理）：${creds.lastError}`)
 
-    // 关键：设置页保存的值以本地 store 为准。
-    // cordis 配置里的默认值（空 URL、默认 scope…）不能反过来把用户填的东西清掉，
-    // 所以只有「显式给了非默认值」时才覆盖，否则原样保留。
-    const previous = store.load()
+    // v0.5（M-16 修复）：**本地 store 是唯一运行时真源**。
+    // cordis 配置行只在「首次运行播种」（store 文件不存在）生效——
+    // 旧版「非默认才覆盖」的启发式会让用户在 patch 里显式写的默认值
+    // （如 schedule.enabled:false）被静默忽略，反过来也绑架 patch 层语义。
+    // 之后调整一律走设置页；整体重置用危险区「重置本机」。
+    const previous = store.hasFile() ? store.load() : null
     const patch: Partial<PluginConfig> = {
-      machineId: config.machineId || previous.machineId,
+      // machineId 只生成一次并持久化（H-2 修复：v0.4 的默认值在模块加载期
+      // 随机生成，每次宿主重启都会覆盖持久身份）
+      machineId: config.machineId || previous?.machineId || generateMachineId(),
       env,
     }
-    if (config.connection.url.trim() || config.connection.username.trim()) {
-      patch.connection = {
-        url: config.connection.url,
-        username: config.connection.username,
-        passwordRef: config.connection.passwordRef,
-      }
+    if (!previous) {
+      patch.connection = { url: config.connection.url, username: config.connection.username }
+      patch.options = config.options
+      patch.schedule = config.schedule
+      patch.scope = config.scope
+      patch.conflictPolicy = config.conflictPolicy
+      patch.syncOptions = { ...DEFAULT_SYNC_OPTIONS, ...config.syncOptions }
     }
-    const opt = config.options
-    if (opt.timeoutMs !== 30000 || opt.remoteRoot !== REMOTE_ROOT || opt.ignoreTlsErrors) {
-      patch.options = opt
-    }
-    const sched = config.schedule
-    if (sched.enabled || sched.intervalHours !== 1 || sched.direction !== 'both') {
-      patch.schedule = sched
-    }
-    const scope = config.scope
-    const scopeIsDefault =
-      scope.bundles.mode === 'all' &&
-      scope.skills.mode === 'all' &&
-      scope.configs.mode === 'none' &&
-      scope.bundles.exclude.length === 0 &&
-      scope.skills.exclude.length === 0 &&
-      scope.configs.includeKeys.length === 0
-    if (!scopeIsDefault) patch.scope = scope
-    if (config.conflictPolicy !== 'auto') patch.conflictPolicy = config.conflictPolicy
-    const syncChanged = (Object.keys(DEFAULT_SYNC_OPTIONS) as (keyof SyncOptions)[]).some(
-      (key) => config.syncOptions?.[key] !== DEFAULT_SYNC_OPTIONS[key],
-    )
-    if (syncChanged) patch.syncOptions = { ...previous.syncOptions, ...config.syncOptions }
-
     store.update(patch)
 
     runtime.store = store
@@ -419,6 +418,13 @@ export function apply(ctx: unknown, config: Config) {
       client: createWebDavClient(conn),
       progress: ready.progress,
       logger: ready.logger!,
+      // v0.5：bundle 安装走宿主 pluginManager 服务（C-2）；
+      // 定时触发复用 host 互斥（H-12：调度器不再绕过 runtime.running 并发跑）
+      installBundleDir: installBundleDir ?? undefined,
+      scheduledTrigger: (trigger) => {
+        const l = launch(trigger)
+        return l.promise ?? Promise.resolve(createBusyReport(l.runId, trigger))
+      },
     })
     ready.engine = engine
     ready.engineSig = sig
@@ -449,7 +455,7 @@ export function apply(ctx: unknown, config: Config) {
     promise: Promise<SyncRunReport> | null
   }
 
-  function launch(trigger: SyncTrigger): Launch {
+  function launch(trigger: SyncTrigger, opts: { confirmBulkDelete?: boolean } = {}): Launch {
     if (runtime.running) {
       const runId = runtime.currentRunId ?? runtime.progress.snapshot().runId ?? generateRunId()
       return { started: false, alreadyRunning: true, runId, promise: null }
@@ -458,15 +464,15 @@ export function apply(ctx: unknown, config: Config) {
     const runId = generateRunId()
     runtime.running = true
     runtime.currentRunId = runId
-    const promise = engine.runOnce(trigger, { runId }).finally(() => {
+    const promise = engine.runOnce(trigger, { runId, confirmBulkDelete: opts.confirmBulkDelete === true }).finally(() => {
       runtime.running = false
       runtime.currentRunId = null
     })
     return { started: true, alreadyRunning: false, runId, promise }
   }
 
-  function startSync(trigger: SyncTrigger = 'manual'): StartSyncResult {
-    const launched = launch(trigger)
+  function startSync(trigger: SyncTrigger = 'manual', opts: { confirmBulkDelete?: boolean } = {}): StartSyncResult {
+    const launched = launch(trigger, opts)
     if (launched.promise) {
       launched.promise.catch((err: unknown) => {
         log('error', 'sync', `同步失败：${(err as Error).message}`, { runId: launched.runId })
@@ -491,7 +497,6 @@ export function apply(ctx: unknown, config: Config) {
       connection: {
         url: cfg.connection.url,
         username: cfg.connection.username,
-        passwordRef: cfg.connection.passwordRef,
         hasPassword: runtime.password !== '',
       },
       options: cfg.options,
@@ -539,9 +544,15 @@ export function apply(ctx: unknown, config: Config) {
       JSON.stringify(cur.options) !== JSON.stringify(next.options)
 
     // profile 显式指定：重新探测环境（下次同步使用新 profile）
-    if (typeof body.profile === 'string' && body.profile.trim() && body.profile.trim() !== rt.env.profile) {
-      runtime.profileOverride = body.profile.trim()
-      await doReprobe(runtime.profileOverride, rt)
+    if (typeof body.profile === 'string' && body.profile.trim()) {
+      const wanted = body.profile.trim()
+      if (!PROFILE_NAME_RE.test(wanted)) {
+        throw new Error('profile 名不合法（仅允许字母数字与 . _ -，1-64 字符）')
+      }
+      if (wanted !== rt.env.profile) {
+        runtime.profileOverride = wanted
+        await doReprobe(runtime.profileOverride, rt)
+      }
     } else if (scheduleChanged || connectionChanged) {
       const engine = getEngine()
       if (scheduleChanged) startSchedulerFor(engine, next)
@@ -550,15 +561,24 @@ export function apply(ctx: unknown, config: Config) {
     return publicConfigOf(rt)
   }
 
+  /** 锁持有者缓存：/status 是轮询热点（client 每 900ms），不能每次都打远端 */
+  let lockCache: { at: number; value: StatusPayload['lock'] } | null = null
+  const LOCK_CACHE_MS = 15_000
+
   async function statusOf(): Promise<StatusPayload> {
     const rt = await ensureReady()
     const cfg = rt.store.load()
     let lock: StatusPayload['lock'] = null
     if (cfg.connection.url) {
-      try {
-        lock = await createWebDavClient(connectionConfigOf(cfg, runtime.password)).currentLockHolder()
-      } catch {
-        lock = null
+      if (lockCache && Date.now() - lockCache.at < LOCK_CACHE_MS) {
+        lock = lockCache.value
+      } else {
+        try {
+          lock = await createWebDavClient(connectionConfigOf(cfg, runtime.password)).currentLockHolder()
+        } catch {
+          lock = null
+        }
+        lockCache = { at: Date.now(), value: lock }
       }
     }
     const snapshot = runtime.progress.snapshot()
@@ -610,7 +630,9 @@ export function apply(ctx: unknown, config: Config) {
       configs: { mode: 'all', includeKeys: [] },
     }
     const errors: { stage: string; message: string }[] = []
-    const entries = await scanLocal(rt.env, listingScope, errors, { cache: new HashCache(rt.env.dshHome || os.tmpdir()) })
+    const entries = await scanLocal(rt.env, listingScope, errors, {
+      cache: rt.env.dshHome ? new HashCache(rt.env.dshHome) : null,
+    })
     if (errors.length > 0) log('warn', 'env', `扫描条目时出现 ${errors.length} 条告警`)
     const configKeys = listConfigTopKeysSafe(rt.env.settingsFile)
     return entries
@@ -638,7 +660,11 @@ export function apply(ctx: unknown, config: Config) {
     let remote: RemoteManifest = emptyManifest()
     if (cfg.connection.url) {
       try {
-        remote = (await new WebDavSyncStore(connectionConfigOf(cfg, runtime.password)).read()).manifest
+        const outcome = await new WebDavSyncStore(connectionConfigOf(cfg, runtime.password)).read()
+        remote = outcome.manifest
+        for (const dp of outcome.dropped) {
+          errors.push({ stage: 'manifest', message: `清单条目 ${dp.name} 非法已忽略：${dp.why}` })
+        }
       } catch (err) {
         errors.push({ stage: 'manifest', message: `读取远端清单失败：${(err as Error).message}` })
       }
@@ -652,7 +678,11 @@ export function apply(ctx: unknown, config: Config) {
           remote,
           lastSynced: cfg.lastSynced ?? {},
           policy: cfg.conflictPolicy,
-          options: { autoResolve: cfg.syncOptions.autoResolve, propagateDeletions: cfg.syncOptions.propagateDeletions },
+          options: {
+            autoResolve: cfg.syncOptions.autoResolve,
+            propagateDeletions: cfg.syncOptions.propagateDeletions,
+            autoInstall: cfg.syncOptions.autoInstall,
+          },
           direction: cfg.schedule.direction,
           machineId: cfg.machineId,
         }),
@@ -731,6 +761,17 @@ export function apply(ctx: unknown, config: Config) {
     rt.store.save(next)
     runtime.progress.reset()
     runtime.capabilities = null
+    // v0.5：连「已安装标记」一起清掉——否则重置后重新同步会误判"已是最新"而跳过安装
+    if (rt.env.dshHome) {
+      const dataDir = path.join(rt.env.dshHome, '.webdav-enhanced')
+      for (const markDir of ['installed-bundles', 'installed-skills']) {
+        try {
+          rmSync(path.join(dataDir, markDir), { recursive: true, force: true })
+        } catch {
+          /* 尽力而为 */
+        }
+      }
+    }
     log('warn', 'system', '已重置本机同步状态（machineId 保留）')
     return { ok: true as const }
   }
@@ -745,13 +786,19 @@ export function apply(ctx: unknown, config: Config) {
     const { manifest, etag } = await store.read()
     const alive = manifest.entries.filter((e) => !e.deleted)
     let removed = 0
+    let failed = 0
     for (const entry of alive) {
       try {
-        await client.deleteFile(entry.file)
-        removed += 1
+        // v0.5（M-6）：deleteFile 不再吞错——按真实结果计数；
+        // 有失败就不清账本，留着 etag 让下轮重试
+        if (await client.deleteFile(entry.file)) removed += 1
       } catch {
-        /* 尽力而为：单文件失败不阻塞整体清空 */
+        failed += 1
       }
+    }
+    if (failed > 0) {
+      log('warn', 'system', `清空远端：已删 ${removed} 个文件，${failed} 个失败——账本保留，下轮同步自动重试`)
+      return { ok: true as const, removed }
     }
     await store.commit(emptyManifest(), etag, null)
     rt.store.update({ lastSynced: {} })
@@ -778,40 +825,93 @@ export function apply(ctx: unknown, config: Config) {
     runSync,
   }
 
-  // ---------- 服务注入 ----------
-  // cordis 的 ctx 是代理：直接读 ctx.webServer / ctx.tools 会抛
-  // "cannot get property without inject"，必须先声明再在回调里访问。
-  host.inject(['webServer'], (services) => {
-    if (!services.webServer) {
+  // ---------- 服务注册（v0.5：全部纳入 ctx.effect 生命周期，H-15） ----------
+  // webServer / tools 由模块级 inject 静态声明，可直接访问；
+  // pluginManager 经 ctx.inject 动态申请——缺它的组合里保持惰性，
+  // bundle 自动安装退化为 manual-needed，绝不 shell 调 CLI（C-2）。
+  host.effect(() => {
+    if (!host.webServer) {
       log('warn', 'system', 'webServer 服务不可用，设置页 API 未注册')
       return
     }
-    registerHttpRoutes(services.webServer, httpContext)
-  })
+    const disposeRoutes = registerHttpRoutes(host.webServer, httpContext)
+    log('info', 'system', `设置页 API 已注册：${HTTP_PREFIX}/*`)
+    return disposeRoutes
+  }, 'webdav-enhanced: http-routes')
 
-  host.inject(['tools'], (services) => {
-    const tools = services.tools
-    if (!tools) return
+  host.effect(() => {
+    const tools = host.tools
+    if (!tools) {
+      log('warn', 'system', 'tools 服务不可用，Agent 工具未注册')
+      return
+    }
+    const renderJson = (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
 
-    tools.register({
+    // v0.5（H-1）：宿主 ToolsService.register 强制 output.render 必须是函数，
+    // v0.4 只给了 schema → register 抛 TypeError，两个工具从未注册成功
+    const disposeStatus = tools.register({
       name: 'webdav_sync_status',
       description: '查询 WebDAV 同步状态：上次同步时间、当前锁持有者、环境探测结果',
-      parameters: {},
-      output: { schema: { type: 'object' } },
+      parameters: { type: 'object', properties: {} },
+      output: { schema: { type: 'object' }, render: renderJson },
       async execute() {
         return await statusOf()
       },
     })
 
-    tools.register({
+    const disposeNow = tools.register({
       name: 'webdav_sync_now',
-      description: '立即执行一次 WebDAV 同步（方向与冲突策略按当前配置）',
-      parameters: {},
-      output: { schema: { type: 'object' } },
-      async execute() {
-        return runSync()
+      description:
+        '立即执行一次 WebDAV 同步（方向与冲突策略按当前配置）；批量删除护栏阻断时报告含 stage=bulk-delete-guard，确认属预期后带 confirmBulkDelete 重跑',
+      parameters: {
+        type: 'object',
+        properties: {
+          confirmBulkDelete: {
+            type: 'boolean',
+            description: '本轮允许批量删除本机条目（默认护栏阻断远端账本异常导致的大面积删除）',
+          },
+        },
+      },
+      output: { schema: { type: 'object' }, render: renderJson },
+      async execute(args) {
+        const confirm = !!(args as { confirmBulkDelete?: boolean } | undefined)?.confirmBulkDelete
+        await ensureReady()
+        const launched = launch('manual', { confirmBulkDelete: confirm })
+        return launched.promise ?? createBusyReport(launched.runId, 'manual')
       },
     })
+
+    return () => {
+      try {
+        disposeStatus()
+      } catch {
+        /* ignore */
+      }
+      try {
+        disposeNow()
+      } catch {
+        /* ignore */
+      }
+    }
+  }, 'webdav-enhanced: agent-tools')
+
+  host.inject(['pluginManager'], (services) => {
+    const pm = services.pluginManager
+    if (!pm || typeof pm.installBundle !== 'function') return
+    installBundleDir = async (dir: string) => {
+      try {
+        await pm.installBundle(dir)
+        return { ok: true }
+      } catch (err) {
+        return { ok: false, message: (err as Error)?.message ?? String(err) }
+      }
+    }
+    // 让已建引擎带上新安装入口
+    if (runtime.engine) {
+      runtime.engine.stopScheduler()
+      runtime.engine = null
+      runtime.engineSig = null
+    }
   })
 
   // ---------- 启动即初始化（让持久化的定时同步在无人打开设置页时也能生效） ----------

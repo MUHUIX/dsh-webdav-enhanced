@@ -43,7 +43,7 @@ describe('pack', () => {
     const h1 = await hashDirectory(makeEntry())
     const h2 = await hashDirectory(makeEntry())
     expect(h1).toBe(h2)
-    expect(zipBaseName({ ...makeEntry(), hash: h1 })).toBe('my-skill@1.0.0-' + h1.slice(0, 8))
+    expect(zipBaseName({ ...makeEntry(), hash: h1 })).toBe('my-skill@1.0.0-' + h1)
   })
 
   it('pack excludes node_modules and unpack restores content with meta', async () => {

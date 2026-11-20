@@ -1,3 +1,4 @@
 - insert:
     - id: webdav-enhanced
       name: dsh-webdav-enhanced
+      config: {}

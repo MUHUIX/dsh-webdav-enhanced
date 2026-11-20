@@ -9,7 +9,7 @@
  *   迁移后立即落盘并删除旧字段。
  */
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, fsyncSync, closeSync, unlinkSync } from 'node:fs'
 import { hostname } from 'node:os'
 import path from 'node:path'
 import {
@@ -71,7 +71,7 @@ export function defaultSyncOptions(patch: Partial<SyncOptions> = {}): SyncOption
 
 export function defaultConfig(machineId?: string): PluginConfig {
   return {
-    connection: { url: '', username: '', passwordRef: 'credentials' },
+    connection: { url: '', username: '' },
     options: { timeoutMs: 30000, remoteRoot: '/dsh-sync/', ignoreTlsErrors: false },
     scope: defaultScope(),
     schedule: { enabled: false, intervalHours: 1, direction: 'both' },
@@ -101,7 +101,13 @@ function safeHostname(): string {
 // ---------- 深度默认值合并（只对已知子结构做一层合并，未知字段原样保留） ----------
 
 function mergeConfig(base: PluginConfig, raw: Record<string, unknown>): PluginConfig {
-  const connection = { ...base.connection, ...((raw.connection as object) ?? {}) }
+  // v0.5：connection 白名单重建——历史版本可能存过 password/passwordRef，
+  // 一律不再透传（L-5：旧明文密码字段每次 save 都会原样带回去，永不消失）。
+  const rawConn = (raw.connection as Record<string, unknown> | undefined) ?? {}
+  const connection: PluginConfig['connection'] = {
+    url: typeof rawConn.url === 'string' ? rawConn.url : base.connection.url,
+    username: typeof rawConn.username === 'string' ? rawConn.username : base.connection.username,
+  }
   const options = { ...base.options, ...((raw.options as object) ?? {}) }
   const schedule = { ...base.schedule, ...((raw.schedule as object) ?? {}) }
   const rawScope = (raw.scope as Record<string, unknown>) ?? {}
@@ -173,11 +179,20 @@ export class ConfigStore {
     this.filePath = path.join(dir, CONFIG_FILENAME)
   }
 
+  /** 磁盘上是否已有配置（host 用它决定"首次播种 vs 以 store 为准"，M-16） */
+  hasFile(): boolean {
+    return existsSync(this.filePath)
+  }
+
+  /**
+   * 读取配置。**只读**：文件缺失返回内存默认值，不落盘（M-9：
+   * v0.4 的 load() 带写副作用，与 /plan「干跑不写本地状态」的注释相悖）。
+   * 需要持久化请显式走 save()/update()。
+   */
   load(): PluginConfig {
     if (this.cache) return this.cache
     if (!existsSync(this.filePath)) {
       this.cache = defaultConfig()
-      this.save(this.cache)
       return this.cache
     }
     try {
@@ -191,7 +206,7 @@ export class ConfigStore {
       }
       return cfg
     } catch {
-      // 配置损坏：备份后重置
+      // 配置损坏：备份后重置（损坏备份仍落盘——这是恢复动作，不是读副作用）
       this.backupCorrupt()
       this.cache = defaultConfig()
       this.save(this.cache)
@@ -199,12 +214,45 @@ export class ConfigStore {
     }
   }
 
+  /**
+   * 原子写：唯一临时名（pid+随机，v0.4 固定 .tmp 会让双实例互踩）→ fsync → rename。
+   * fsync 保证 rename 后断电不留下 0 字节的"正式文件"。
+   */
   save(cfg: PluginConfig): void {
     this.cache = cfg
-    // 原子写：先写临时文件再 rename，避免崩溃半截
-    const tmp = this.filePath + '.tmp'
-    writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8')
-    renameSync(tmp, this.filePath)
+    const tmp = `${this.filePath}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`
+    const text = JSON.stringify(cfg, null, 2)
+    let fd: number | null = null
+    try {
+      fd = openSync(tmp, 'w')
+      writeFileSync(fd, text, 'utf8')
+      try {
+        fsyncSync(fd)
+      } catch {
+        /* 平台不支持 fsync：退化为尽力而为 */
+      }
+      renameSync(tmp, this.filePath)
+    } catch (err) {
+      try {
+        if (fd !== null) closeSync(fd)
+      } catch {
+        /* ignore */
+      }
+      try {
+        if (existsSync(tmp)) unlinkSync(tmp)
+      } catch {
+        /* ignore */
+      }
+      throw err
+    } finally {
+      if (fd !== null) {
+        try {
+          closeSync(fd)
+        } catch {
+          /* 已关闭 */
+        }
+      }
+    }
   }
 
   update(patch: Partial<PluginConfig>): PluginConfig {

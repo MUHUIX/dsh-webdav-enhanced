@@ -71,8 +71,10 @@ class MemoryClient implements WebDavClient {
   async putJsonIfMatch(): Promise<string | null> {
     return null
   }
-  async deleteFile(p: string): Promise<void> {
+  async deleteFile(p: string): Promise<boolean> {
+    const had = this.files.has(p)
     this.files.delete(p)
+    return had
   }
   async move(a: string, b: string): Promise<void> {
     const f = this.files.get(a)
@@ -98,8 +100,14 @@ class MemoryClient implements WebDavClient {
 
 class MemoryStore implements SyncStore {
   manifest: RemoteManifest = emptyManifest()
+  beginRun(): void {
+    /* mock 无缓存 */
+  }
+  invalidate(): void {
+    /* mock 无缓存 */
+  }
   async read() {
-    return { manifest: this.manifest, etag: null }
+    return { manifest: this.manifest, etag: null, dropped: [] as { name: string; why: string }[] }
   }
   async commit(next: RemoteManifest): Promise<string | null> {
     this.manifest = next
@@ -288,7 +296,7 @@ describe('SyncEngine v2', () => {
     expect(synced['skill:remote-skill'].hash).toMatch(/^[0-9a-f]{64}$/)
   }, 20000)
 
-  it('autoInstall=false：下载但不落盘，不写 lastSynced', async () => {
+  it('autoInstall=false：下载但不落盘，登记 installed:false，开启后补装且不重复下载', async () => {
     makeLocalSkill('local-skill')
     await makeRemoteSkill('remote-skill')
     const engine = makeEngine({ syncOptions: { autoInstall: false } })
@@ -296,8 +304,17 @@ describe('SyncEngine v2', () => {
     expect(report.downloaded).toEqual([])
     expect(existsSync(path.join(env.skillsDir, 'remote-skill'))).toBe(false)
     const synced = configStore.load().lastSynced
-    expect(synced['skill:remote-skill']).toBeUndefined()
+    // v0.5（M-15）：不写"未同步"，而是写 installed:false —— 开启自动安装后补装，
+    // 期间不会再每轮重复下载（旧实现会重下）
+    expect(synced['skill:remote-skill']).toBeDefined()
+    expect(synced['skill:remote-skill'].installed).toBe(false)
     expect(synced['skill:local-skill']).toBeDefined()
+
+    // 开启 autoInstall 再跑一轮：应补装（download），而不是因"远端已知"跳过
+    const engine2 = makeEngine({ syncOptions: { autoInstall: true } })
+    const r2 = await engine2.runOnce('manual')
+    expect(r2.downloaded).toContain('skill:remote-skill')
+    expect(existsSync(path.join(env.skillsDir, 'remote-skill', 'SKILL.md'))).toBe(true)
   }, 20000)
 
   it('取消：在当前条目结束后停止，剩余条目保持 pending', async () => {

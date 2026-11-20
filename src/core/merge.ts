@@ -170,32 +170,38 @@ interface Divergence {
   reason: string
 }
 
-/** 两端都改过的分叉：按 policy + autoResolve 裁决（决策表第 5 行） */
+/**
+ * 两端都改过的分叉：按 policy + autoResolve 裁决（决策表第 5 行）。
+ * v0.5（H-4 修复）：除 ask/manual 保留冲突外，所有"选边"结果一律返回
+ * action='merge'——merge 是执行器唯一做"输家备份"的路径。v0.4 把
+ * local-wins/remote-wins/merge-backup 直接映射成裸 upload/download，
+ * 备份没做、reason 还宣称"已备份"（UI 说谎）。
+ */
 function resolveDivergence(
   policy: ConflictPolicy,
   autoResolve: MergeInputV2['options']['autoResolve'],
   local: LocalEntry,
   remote: RemoteEntry,
 ): Divergence {
-  const adopt = (winner: 'local' | 'remote', extra = ''): Divergence => ({
-    action: winner === 'local' ? 'upload' : 'download',
+  const adopt = (winner: 'local' | 'remote', prefix = '两端均已修改'): Divergence => ({
+    action: 'merge',
     winner,
-    reason: `两端均已修改，自动采用${winner === 'local' ? '本机' : '远端'}，另一侧已备份${extra}`,
+    reason: `${prefix}，自动采用${winner === 'local' ? '本机' : '远端'}，另一侧已备份`,
   })
 
   switch (policy) {
     case 'local-wins':
-      return { action: 'upload', winner: 'local', reason: '两端均已修改，按 local-wins 策略采用本机' }
+      return adopt('local', '两端均已修改，按 local-wins 策略')
     case 'remote-wins':
-      return { action: 'download', winner: 'remote', reason: '两端均已修改，按 remote-wins 策略采用远端' }
+      return adopt('remote', '两端均已修改，按 remote-wins 策略')
     case 'merge-backup':
       return adopt('remote')
     case 'ask':
       return { action: 'conflict', reason: '两端均已修改，ask 策略下保留冲突待人工选择' }
     case 'auto':
     default: {
-      if (autoResolve === 'local') return { action: 'upload', winner: 'local', reason: '两端均已修改，自动采用本机，另一侧已备份' }
-      if (autoResolve === 'remote') return adopt('remote')
+      if (autoResolve === 'local') return adopt('local', '两端均已修改')
+      if (autoResolve === 'remote') return adopt('remote', '两端均已修改')
       if (autoResolve === 'manual') return { action: 'conflict', reason: '两端均已修改，manual 策略下保留冲突待人工选择' }
       const pick = pickWinner(local, remote)
       return {
@@ -244,16 +250,18 @@ export function decideV2(input: MergeInputV2): MergeDecisionV2[] {
         continue
       }
       if (!base) {
-        // 首次同步发现两端不一致：auto 裁决（无 mtime 优势时 remote 赢）
-        const pick = pickWinner(local, remote)
+        // 首次同步发现两端不一致（H-11 修复）：没有 base 就没有"谁改了"的依据，
+        // 等价于双端分叉——统一走 resolveDivergence：ask/manual 保留冲突，
+        // 其余策略按分叉合并（赢家胜出、输家备份），不再无视用户策略自动裁决。
+        const d = resolveDivergence(input.policy, input.options.autoResolve, local, remote)
         out.push(
           decision(
             {
               kind: local.kind,
               name: local.name,
-              action: 'merge',
-              winner: pick.winner,
-              reason: `首次同步发现两端不一致，自动合并（${pick.reason}）`,
+              action: d.action,
+              winner: d.winner,
+              reason: d.reason.startsWith('两端均已修改') ? d.reason.replace('两端均已修改', '首次同步发现两端不一致') : `首次同步发现两端不一致（${d.reason}）`,
               backupHint: backupHintFor(local.name, input.machineId),
             },
             local,
@@ -333,7 +341,23 @@ export function decideV2(input: MergeInputV2): MergeDecisionV2[] {
     const r = remote!
     if (base) {
       if (r.hash === base.hash) {
-        if (propagate) {
+        if (base.installed === false) {
+          // v0.5（M-15）：autoInstall 关闭时"只登记未安装"的条目——
+          // 开启后补装；仍关闭则跳过（不再每轮重复下载，也不会误判成"本机已删"）
+          if (input.options.autoInstall) {
+            out.push(
+              decision(
+                { kind: r.kind, name: r.name, action: 'download', winner: 'remote', reason: '此前按配置未安装，本轮补装远端版本' },
+                undefined,
+                r,
+              ),
+            )
+          } else {
+            out.push(
+              decision({ kind: r.kind, name: r.name, action: 'skip', reason: 'autoInstall 关闭：远端内容已知，跳过下载' }, undefined, r),
+            )
+          }
+        } else if (propagate) {
           out.push(decision({ kind: r.kind, name: r.name, action: 'delete-remote', reason: '本机已删除，远端同步删除（进回收站）' }, undefined, r))
         } else {
           out.push(decision({ kind: r.kind, name: r.name, action: 'skip', reason: '本机已删除，远端保留（未开启删除传播）' }, undefined, r))
@@ -468,7 +492,7 @@ class MergerImpl implements Merger {
       remote: input.remote,
       lastSynced: legacySnapshots(input),
       policy: input.policy,
-      options: { autoResolve: 'auto', propagateDeletions: true },
+      options: { autoResolve: 'auto', propagateDeletions: true, autoInstall: true },
       direction: 'both',
       machineId: input.machineId,
     })

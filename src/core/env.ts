@@ -124,6 +124,7 @@ function buildEmpty(profile: string): ResolvedEnv {
     dshHome: '',
     profileDir: '',
     skillsDir: '',
+    skillRoots: [],
     settingsFile: null,
     credentialsFile: null,
     profile,
@@ -133,6 +134,40 @@ function buildEmpty(profile: string): ResolvedEnv {
     generation: 'unknown',
     extras: [],
   }
+}
+
+function realpathOrNull(p: string): string | null {
+  try {
+    return realpathSync(p)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 技能扫描根（v0.5，H-6）：按宿主 dsh-skill-filesystem 的口径探测——
+ * [dshHome/skills, agentsHome/skills(~/.agents/skills), ~/.claude/skills]。
+ * 全部不存在时返回 [dshHome/skills]（规范目录，首次使用自动创建）。
+ * 顺序即优先级：新下载条目落到第一个现存根；同名条目按 realpath 去重。
+ */
+export function detectSkillRoots(dshHome: string): string[] {
+  const home = homedir()
+  const agentsHome = process.env.AGENTS_HOME?.trim() || path.join(home, '.agents')
+  const candidates = [
+    path.join(dshHome, 'skills'),
+    path.join(agentsHome, 'skills'),
+    path.join(home, '.claude', 'skills'),
+  ]
+  const existing: string[] = []
+  const seen = new Set<string>()
+  for (const dir of candidates) {
+    const real = realpathOrNull(dir)
+    if (!real || !isDir(real)) continue
+    if (seen.has(real)) continue
+    seen.add(real)
+    existing.push(dir)
+  }
+  return existing.length > 0 ? existing : [path.join(dshHome, 'skills')]
 }
 
 /**
@@ -162,8 +197,16 @@ export async function resolveEnv(opts: EnvProbeOptions = {}): Promise<ResolvedEn
   if (!primary) return buildEmpty(profile)
 
   const generation = classifyGeneration(primary)
-  const settingsFile =
-    [SETTINGS, 'settings.yml'].map((f) => path.join(primary, f)).find((f) => existsSync(f)) ?? null
+  // settings 探测面扩到 profileDir（v0.5，H-6：桌面版 0.2.x 没有全局 settings.yaml，
+  // 老布局 / web profile 的 settings 也可能落在 profile 目录）。找不到就是 null——
+  // 上层必须如实向 UI/文档报告"配置同步在本布局不生效"，不得静默。
+  const settingsCandidates = [
+    path.join(primary, SETTINGS),
+    path.join(primary, 'settings.yml'),
+    path.join(primary, 'profiles', profile, SETTINGS),
+    path.join(primary, 'profiles', profile, 'settings.yml'),
+  ]
+  const settingsFile = settingsCandidates.find((f) => existsSync(f)) ?? null
   const credentialsFile = existsSync(path.join(primary, CREDENTIALS))
     ? path.join(primary, CREDENTIALS)
     : null
@@ -171,12 +214,14 @@ export async function resolveEnv(opts: EnvProbeOptions = {}): Promise<ResolvedEn
   // cordis 代：profile 目录优先 <dshHome>/profiles/<profile>，不存在则退回 dshHome
   const profileCandidate = path.join(primary, 'profiles', profile)
   const profileDir = generation === 'cordis' && isDir(profileCandidate) ? profileCandidate : primary
-  const skillsDir = path.join(primary, 'skills')
+  const skillRoots = detectSkillRoots(primary)
+  const skillsDir = skillRoots[0]
 
   return {
     dshHome: primary,
     profileDir,
     skillsDir,
+    skillRoots,
     settingsFile,
     credentialsFile,
     profile,

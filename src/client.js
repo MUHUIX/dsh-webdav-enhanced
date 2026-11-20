@@ -109,13 +109,15 @@ window.__ModuleLoader__.load({
           analyzeSummary: '共 {total} 个条目：上传 {upload} · 下载 {download} · 合并 {merge} · 跳过 {skip} · 删除 {remove}',
           analyzeAt: '分析于 {time}',
           restartNeeded: '有 {n} 项需要重启 dsh 才生效：{list}',
+          notSupported: '当前后端还没有该能力接口，升级 dsh-webdav-enhanced 后重启即可使用。',
+          bulkGuard: '本轮存在被护栏阻断的批量删除（远端账本可能异常）；如确属预期，请再次点击「立即同步」确认执行。',
         },
         guide: {
           lead: '一台机器配好，其余机器自动跟上。不用再重复安装插件、手工拷贝配置，也不用为了对齐环境折腾一晚上。',
           chip1: '内容哈希去重',
           chip2: '自动合并',
           chip3: '实时进度',
-          quickTitle: '三步上手',
+          quickTitle: '四步上手',
           quick1Title: '连接服务器',
           quick1Desc: '在「连接」页填地址、账号、密码，点「测试连接」。测试会依次验证读取、建目录、写入与回读，通过后自动保存。',
           quick2Title: '选择同步内容',
@@ -198,6 +200,8 @@ window.__ModuleLoader__.load({
           remoteRoot: '远端同步根目录',
           tls: '忽略 TLS 证书错误',
           tlsHint: '仅内网自签证书场景开启',
+          test: '测试连接',
+          testing: '测试中…',
           ok: '连接成功',
           fail: '连接失败',
           server: '服务端',
@@ -313,6 +317,8 @@ window.__ModuleLoader__.load({
           skip: '跳过',
           deleteLocal: '删本地',
           deleteRemote: '删远端',
+          'delete-local': '删本地',
+          'delete-remote': '删远端',
           conflict: '冲突',
         },
         status: {
@@ -448,13 +454,15 @@ window.__ModuleLoader__.load({
           analyzeSummary: '{total} items: upload {upload} · download {download} · merge {merge} · skip {skip} · remove {remove}',
           analyzeAt: 'Analyzed at {time}',
           restartNeeded: '{n} item(s) need a dsh restart to take effect: {list}',
+          notSupported: 'This backend has no such endpoint yet; update dsh-webdav-enhanced and restart dsh.',
+          bulkGuard: 'A bulk deletion was blocked by the guard (the remote ledger may be inconsistent). If this is expected, click Sync again to confirm.',
         },
         guide: {
           lead: 'Set it up once and the other machines catch up on their own — no reinstalling plugins or hand-copying config.',
           chip1: 'Content-addressed dedupe',
           chip2: 'Automatic merge',
           chip3: 'Live progress',
-          quickTitle: 'Three steps',
+          quickTitle: 'Get started in four steps',
           quick1Title: 'Connect the server',
           quick1Desc: 'On the Connection tab fill the URL, account and password, then test. The test checks read, mkdir, write and read-back, and saves on success.',
           quick2Title: 'Pick what to sync',
@@ -537,6 +545,8 @@ window.__ModuleLoader__.load({
           remoteRoot: 'Remote sync root',
           tls: 'Ignore TLS certificate errors',
           tlsHint: 'Only for self-signed intranet certificates',
+          test: 'Test connection',
+          testing: 'Testing…',
           ok: 'Connected',
           fail: 'Connection failed',
           server: 'Server',
@@ -652,6 +662,8 @@ window.__ModuleLoader__.load({
           skip: 'Skip',
           deleteLocal: 'Remove local',
           deleteRemote: 'Remove remote',
+          'delete-local': 'Remove local',
+          'delete-remote': 'Remove remote',
           conflict: 'Conflict',
         },
         status: {
@@ -869,7 +881,8 @@ window.__ModuleLoader__.load({
     function switchRow(labelText, hint, checked) {
       const box = document.createElement('input')
       box.type = 'checkbox'
-      box.role = 'switch'
+      // v0.5：不再覆写 role=switch——input[type=checkbox] 自带 checked→aria-checked
+      // 映射；覆写后 aria-checked 不会自动同步，读屏器会停在旧状态（L-9）
       box.checked = !!checked
       const track = h('span', 'wds-switch-track')
       const control = h('span', 'wds-switch', box, track)
@@ -935,10 +948,19 @@ window.__ModuleLoader__.load({
 
     async function api(path, options) {
       const opts = options || {}
+      let signal = null
+      try {
+        // v0.5（M-18）：宿主阻塞时不能让请求永远悬着——20s 上限（比后端 30s 短，
+        // 让 UI 先于后端恢复响应）
+        if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) signal = AbortSignal.timeout(20000)
+      } catch (err) {
+        /* 老浏览器没有 timeout：退化为无超时 */
+      }
       const res = await fetch(API_BASE + path, {
         method: opts.method || 'GET',
         headers: { 'content-type': 'application/json' },
         body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+        signal: signal || undefined,
       })
       const text = await res.text()
       let parsed = null
@@ -1567,6 +1589,9 @@ window.__ModuleLoader__.load({
           logFilter: 'all',
           logQuery: '',
           autoRefresh: true,
+          bulkPending: false,
+          /** 面板级定时器登记簿：boot 的 disposer 统一清理（v0.5，L） */
+          timers: [],
           notice: { tone: 'info', text: '' },
         }
 
@@ -1724,12 +1749,27 @@ window.__ModuleLoader__.load({
         }
 
         // ---------------- 数据加载 ----------------
-        async function loadConfig() {
+        /** 用户正在面板内编辑表单（任一控件持有焦点）——后台刷新不得覆盖（M-19） */
+        function formEditing() {
+          try {
+            const ae = document.activeElement
+            return !!(ae && ae !== document.body && wrap.contains(ae))
+          } catch (err) {
+            return false
+          }
+        }
+
+        async function loadConfig(options) {
+          const opts = options || {}
           try {
             state.config = await api('/config')
-            panes.connect.fill(state.config)
-            panes.scope.fill(state.config)
-            panes.mode.fill(state.config)
+            if (disposed) return
+            // 同步结束的自动回填：用户正在编辑时跳过表单覆盖（保留 diag/概览刷新）
+            if (!(opts.auto && formEditing())) {
+              panes.connect.fill(state.config)
+              panes.scope.fill(state.config)
+              panes.mode.fill(state.config)
+            }
             panes.diag.fillConfig(state.config)
             if (panes.guide.render) panes.guide.render()
             renderPill()
@@ -1764,6 +1804,7 @@ window.__ModuleLoader__.load({
             }
             return
           }
+          if (disposed) return // v0.5（M-17）：await 期间被卸载，绝不能再起轮询
           const wasActive = !!(state.progress && state.progress.active)
           state.progress = prog
           panes.overview.render()
@@ -1774,7 +1815,8 @@ window.__ModuleLoader__.load({
             if (wasActive) {
               await loadStatus()
               await loadLogs()
-              void loadConfig()
+              if (disposed) return
+              void loadConfig({ auto: true })
             }
           }
         }
@@ -1795,11 +1837,16 @@ window.__ModuleLoader__.load({
           panes.logs.render()
         }
 
+        let tickBusy = false
         function startPolling() {
-          if (state.pollTimer) return
+          if (state.pollTimer || disposed) return
           state.pollTimer = setInterval(() => {
             if (disposed) return
-            void tick()
+            if (tickBusy) return // v0.5（M-18）：单飞——慢宿主下不叠加请求、不乱序覆盖
+            tickBusy = true
+            void tick().finally(() => {
+              tickBusy = false
+            })
           }, POLL_MS)
         }
 
@@ -1825,7 +1872,15 @@ window.__ModuleLoader__.load({
               stopPolling()
               await loadStatus()
               await loadLogs()
-              void loadConfig()
+              if (disposed) return
+              void loadConfig({ auto: true })
+              // 批量删除护栏触发：把「再次点击立即同步 = 确认执行」挂到同步按钮上
+              const rep = prog && prog.report
+              if (rep && Array.isArray(rep.errors) && rep.errors.some((e) => e.stage === 'bulk-delete-guard')) {
+                state.bulkPending = true
+                state.notice = { tone: 'warn', text: t.overview.bulkGuard || '本轮存在被护栏阻断的批量删除；如确属预期，请再次点击「立即同步」确认执行' }
+                panes.overview.render()
+              }
             }
           } catch (err) {
             /* 单次轮询失败忽略，下一跳重试 */
@@ -1834,8 +1889,10 @@ window.__ModuleLoader__.load({
 
         async function runSync() {
           syncBtn.disabled = true
+          const confirm = state.bulkPending === true
           try {
-            const started = await api('/sync', { method: 'POST', body: { trigger: 'manual' } })
+            const started = await api('/sync', { method: 'POST', body: { trigger: 'manual', confirmBulkDelete: confirm } })
+            state.bulkPending = false
             if (started && started.started) {
               // 立刻先拿一帧进度，避免用户看到 0 状态的空窗
               await loadProgress()
@@ -2489,7 +2546,6 @@ window.__ModuleLoader__.load({
                   url: url.value.trim(),
                   username: user.value.trim(),
                   password: pass.value,
-                  passwordRef: 'credentials',
                 },
                 options: {
                   timeoutMs: Number(timeout.value) || 30000,
@@ -2611,23 +2667,35 @@ window.__ModuleLoader__.load({
               const mode = scopeState[group.key].mode
               countText.textContent = t.scope.loading
               let items = itemsCache[group.key]
+              let loadError = ''
               if (!items) {
                 try {
                   items = await api('/items?kind=' + group.key)
                   itemsCache[group.key] = Array.isArray(items) ? items : []
                 } catch (err) {
                   items = []
+                  loadError = err && err.message ? String(err.message) : String(err)
                 }
               }
               clearNode(rows)
               const excluded = new Set(scopeState[group.key].exclude || [])
+              if (loadError) {
+                // v0.5（L）：失败要说"读取失败"，不能伪装成"没有可同步内容"
+                rows.appendChild(emptyState('alert', t.common.error + ': ' + loadError, ''))
+                countText.textContent = '0'
+                return
+              }
               if (!items.length) {
                 rows.appendChild(emptyState('list', t.scope.empty, ''))
                 countText.textContent = '0'
                 return
               }
               let checkedCount = 0
-              for (const item of items) {
+              for (const item of items) if (mode === 'selected' ? !excluded.has(item.name) : mode === 'all') checkedCount += 1
+              // v0.5（M-20）：上限渲染 + DocumentFragment 一次入树，勾选重建不再逐条操作 DOM
+              const cap = 300
+              const frag = document.createDocumentFragment()
+              for (const item of items.slice(0, cap)) {
                 const box = document.createElement('input')
                 box.type = 'checkbox'
                 box.checked = mode === 'all' ? true : mode === 'none' ? false : !excluded.has(item.name)
@@ -2638,10 +2706,10 @@ window.__ModuleLoader__.load({
                   else next.add(item.name)
                   scopeState[group.key].exclude = [...next]
                   editor.setValues(scopeState[group.key].exclude)
-                  void renderRows()
+                  // 只更新本行的计数文案，不再整表重建
+                  countText.textContent = fillTemplate(t.scope.selectedCount, { n: checkedCountOf(), total: items.length })
                 }
-                if (box.checked) checkedCount += 1
-                rows.appendChild(
+                frag.appendChild(
                   h(
                     'div',
                     'wds-row',
@@ -2656,7 +2724,17 @@ window.__ModuleLoader__.load({
                   ),
                 )
               }
+              if (items.length > cap) {
+                frag.appendChild(h('div', 'wds-hint', t.overview.moreItems ? fillTemplate(t.overview.moreItems, { n: items.length - cap }) : '+' + (items.length - cap)))
+              }
+              rows.appendChild(frag)
               countText.textContent = fillTemplate(t.scope.selectedCount, { n: checkedCount, total: items.length })
+              function checkedCountOf() {
+                const ex = new Set(scopeState[group.key].exclude || [])
+                let n = 0
+                for (const item of items) if (mode === 'selected' ? !ex.has(item.name) : mode === 'all') n += 1
+                return n
+              }
             }
           }
 
@@ -3058,17 +3136,19 @@ window.__ModuleLoader__.load({
               ok = false
             }
             if (!ok) {
+              const area = document.createElement('textarea')
               try {
-                const area = document.createElement('textarea')
                 area.value = text
                 area.style.position = 'fixed'
                 area.style.opacity = '0'
                 document.body.appendChild(area)
                 area.select()
                 ok = document.execCommand('copy')
-                document.body.removeChild(area)
               } catch (err) {
                 ok = false
+              } finally {
+                // v0.5（L）：异常路径也要摘掉临时 textarea，不在 body 留残骸
+                if (area.parentNode) area.parentNode.removeChild(area)
               }
             }
             clearNode(noteSlot)
@@ -3124,6 +3204,7 @@ window.__ModuleLoader__.load({
                 resetBtn.textContent = t.diag.resetTitle
                 resetHint.textContent = t.diag.resetDesc
               }, 5000)
+              state.timers.push(resetTimer)
               return
             }
             if (resetTimer) clearTimeout(resetTimer)
@@ -3239,15 +3320,35 @@ window.__ModuleLoader__.load({
         }
 
         // ---------------- 初始加载 ----------------
+        // 首屏四路并行（v0.5）：/status 会探锁、偶发慢响应，串行会拖到四者之和
         void (async () => {
-          await loadConfig()
-          await loadStatus()
-          await loadProgress()
-          await loadLogs()
+          await Promise.all([
+            loadConfig().catch(() => undefined),
+            loadStatus().catch(() => undefined),
+            loadProgress().catch(() => undefined),
+            loadLogs().catch(() => undefined),
+          ])
         })()
+
+        // 页面不可见时停轮询，回到前台若仍在跑就续上（v0.5，L 性能）
+        const onVisibility = () => {
+          if (disposed) return
+          if (document.hidden) stopPolling()
+          else if (state.progress && state.progress.active) startPolling()
+        }
+        document.addEventListener('visibilitychange', onVisibility)
 
         return () => {
           stopPolling()
+          document.removeEventListener('visibilitychange', onVisibility)
+          for (const timer of state.timers) {
+            try {
+              clearTimeout(timer)
+            } catch (err) {
+              /* ignore */
+            }
+          }
+          state.timers.length = 0
         }
       }
 

@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/dsh-webdav-enhanced?color=4a7dff)](https://www.npmjs.com/package/dsh-webdav-enhanced)
 [![npm downloads](https://img.shields.io/npm/dm/dsh-webdav-enhanced)](https://www.npmjs.com/package/dsh-webdav-enhanced)
-[![GitHub stars](https://img.shields.io/github/stars/HUIdada1/dsh-webdav-enhanced?style=social)](https://github.com/HUIdada1/dsh-webdav-enhanced)
+[![GitHub stars](https://img.shields.io/github/stars/MUHUIX/dsh-webdav-enhanced?style=social)](https://github.com/MUHUIX/dsh-webdav-enhanced)
 [![license](https://img.shields.io/npm/l/dsh-webdav-enhanced)](./LICENSE)
 [![node](https://img.shields.io/node/v/dsh-webdav-enhanced)](./package.json)
 [![DeepSeek Harness plugin](https://img.shields.io/badge/DeepSeek%20Harness-plugin-4a7dff)](https://www.npmjs.com/package/@deepseek-ai/dsh)
@@ -18,13 +18,13 @@ Install once on one machine — the rest follow automatically. Diverged entries 
 | Capability | Details |
 | --- | --- |
 | **Plugin sync** | Bundles from your profile are packed and uploaded; other machines download and install them automatically |
-| **Skill sync** | Skill folders under `$DSH_HOME/skills` are synced as a whole — write once, use everywhere |
-| **Model config sync** | Top-level keys of `settings.yaml`, merged key by key, opt-in and off by default |
+| **Skill sync** | Skill folders (any dir with `SKILL.md`) under the roots dsh itself scans — `$DSH_HOME/skills`, `~/.agents/skills`, `~/.claude/skills` — are synced as a whole |
+| **Model config sync** | Top-level keys of `settings.yaml`, merged key by key, opt-in; only on layouts that have the file (desktop 0.2.x has none, where the feature disables itself) |
 | **Two-way or one-way** | Each machine independently picks two-way, upload-only, or download-only |
-| **Content-addressed dedup** | SHA-256 addressing means the same content is transferred once; a remote file with the same content is reused across entries instead of being uploaded again |
+| **Content-addressed storage** | Directory content and the zip itself each get a SHA-256: an already-uploaded file for the same entry is reused, and downloads are verified by zip hash plus a content re-hash before install |
 | **Three-way merge** | The base is the last synced snapshot, so only entries changed on both sides count as divergent; the winner is decided by modification time, then by version, and the loser is backed up |
 | **Automatic by default** | Auto resolution, install on download, propagated deletions, schedules that take effect on save — no manual conflict handling |
-| **Deletion propagation** | Delete on one side and the other follows: the remote copy moves to `trash/`, the local copy is backed up first |
+| **Deletion propagation** | Delete on one side and the other follows: the remote copy moves to `trash/`, the local copy is backed up first; an anomalous bulk deletion is blocked until confirmed |
 | **Live progress** | Stage, percentage, upload/download/merge/skip/delete counters and the current entry, cancellable while running |
 | **Structured logs** | Written as JSONL by level and category (upload / download / merge / skip / delete / dedupe / conflict / connection / schedule / environment), filterable, searchable and exportable in the UI |
 | **Dry-run analysis** | Preview the difference list (upload, download, merge or skip per entry) before syncing — reads only, writes nothing |
@@ -87,7 +87,7 @@ Most settings live in the settings panel; the rest is set through the profile's 
 | --- | --- | --- |
 | `profile` | auto-detected | Which dsh profile to sync. Leave empty to detect from the profile that installed this plugin: `desktop` for the app, `web` for the Web GUI |
 | `connection.url` / `connection.username` | empty | Also editable in the UI |
-| `connection.password` | empty | First-run migration source only; the local credential file wins afterwards |
+| `connection.password` | — | Removed in v0.5: the cordis config no longer accepts a password; set it in the panel, stored locally |
 | `options.timeoutMs` | `30000` | Per-request WebDAV timeout in milliseconds |
 | `options.remoteRoot` | `/dsh-sync/` | Remote sync root |
 | `options.ignoreTlsErrors` | `false` | Self-signed intranet certificates only |
@@ -101,13 +101,14 @@ Most settings live in the settings panel; the rest is set through the profile's 
 | `syncOptions.maxBackups` | `10` | Local backups kept per entry kind; oldest removed beyond that |
 | `syncOptions.pruneTombstones` | `true` | Prune remote tombstones and expired trash after a run |
 | `syncOptions.hardDelete` | `false` | Physically delete remote tombstones after a run (off means trash only) |
+| `syncOptions.bulkDeleteGuard` | `true` | Block the whole batch when one run plans to delete >3 local entries and >30% of the live remote set, until confirmed |
 | `scope.*` | plugins + skills `all`, config `none` | What to sync |
 
 ## What gets synced
 
-- **Plugins**: profile `package.json` dependencies marked with `dsh.bundle`, packed from their local paths.
-- **Skills**: every folder under `$DSH_HOME/skills` that contains a `SKILL.md`, including all files inside.
-- **Config**: top-level keys of `settings.yaml`, narrowed with `includeKeys` when needed. `.credentials.yaml` never participates, and neither do sensitive top-level keys such as `apiKey` and `credentials`.
+- **Plugins**: profile `package.json` dependencies marked with `dsh.bundle` (or listed in `dsh.profile.bundles`), packed from their local paths. `link:`-installed directories are treated as developer workspaces: upload-only, never deleted by propagation.
+- **Skills**: every folder containing `SKILL.md` under the roots dsh itself scans (`$DSH_HOME/skills`, `~/.agents/skills`, `~/.claude/skills`; existence-filtered, deduped by realpath). Downloads land in the first existing root.
+- **Config**: top-level keys of `settings.yaml`, narrowed with `includeKeys` when needed. `.credentials.yaml` never participates; sensitive top-level keys are skipped as blocks, and `apiKey:`/`token:`-style lines inside kept blocks are stripped line by line with a counted warning.
 
 With scope mode `all`, every non-sensitive top-level key is synced; with mode `custom`, only the keys listed in `includeKeys` are touched.
 
@@ -135,15 +136,20 @@ To opt out of automatic mode and review every conflict by hand, set `conflictPol
 | **Jianguoyun (坚果云)** | Works after enabling WebDAV in account settings; use the app password and keep the interval ≥ 1 hour due to rate limits |
 | **Synology** | Fully supported with the WebDAV Server package |
 | **AList** | Fully supported with any storage driver |
-| **Self-hosted** | Any RFC 4918 implementation; without LOCK / If-Match it degrades to soft locks and conflict copies |
+| **Self-hosted** | Any RFC 4918 implementation; without LOCK it degrades to soft locks, and without working If-Match every commit is verified by read-back and retried on overwrite detection |
 
 ## Security
 
-- **API keys are never synced by default**: `.credentials.yaml` never participates; sensitive top-level keys such as `apiKey` in `settings.yaml` never participate either; config sync is off unless you enable it.
-- **Credentials stay local**: the WebDAV password is written to `$DSH_HOME/.webdav-enhanced/credentials.json` (mode 0600). It never enters the cordis config, never reaches the server, and never appears in any API response.
-- **Integrity checks**: every zip is content-addressed by SHA-256 and verified on download.
-- **Deletions are recoverable**: remote deletions sit in `trash/` for 7 days and local deletions are backed up first, so a mistake can be undone from either side.
-- **Extraction guards**: path traversal and zip bombs are rejected; 128MB per file, 512MB total.
+v0.5 made these boundaries the primary fix target — each one maps to code:
+
+- **API keys are never synced by default**: `.credentials.yaml` never participates; sensitive top-level keys (`apiKey`, `credentials`, …) are skipped as blocks; sensitive field lines inside kept blocks are stripped line by line, with a counted warning in the log.
+- **Credentials stay local**: the WebDAV password is written atomically to `$DSH_HOME/.webdav-enhanced/credentials.json`. Mode 0600 only applies on POSIX — on Windows rely on the user-profile ACL and prefer an app password. It never enters the cordis config, never reaches the server, and never appears in any API response.
+- **Remote data is untrusted input**: every manifest entry is schema-validated (bad name/hash/file entries are dropped and reported); the in-package `_meta` is cross-checked against the ledger identity; every write path is resolved and asserted inside its managed root.
+- **Integrity checks**: downloads verify the zip's SHA-256, then re-hash the unpacked content against the ledger hash; install is refused on any mismatch.
+- **Deletions are recoverable**: remote deletions sit in `trash/` for 7 days (age from the landing timestamp; unknown age is kept, not deleted), local deletions are backed up first, and an anomalous bulk deletion is blocked until confirmed.
+- **`link:` workspaces are protected**: directories outside the profile/skills roots are never moved away by deletion propagation.
+- **The settings API is same-origin only**: `/api/webdav-enhanced/*` validates `Origin` / `Sec-Fetch-Site`; request bodies are capped at 2 MiB.
+- **Timeouts actually apply**: every WebDAV request carries an AbortSignal from `timeoutMs`, so one hung transfer can no longer freeze the whole sync chain.
 
 ## Remote layout
 

@@ -49,6 +49,9 @@ export interface SyncOptions {
   pruneTombstones: boolean
   /** 是否在同步结束后把远端 tombstone 一并物理删除（默认 false，只清 trash） */
   hardDelete: boolean
+  /** 批量删除护栏：单轮 delete-local 条目数超过阈值（>3 且 >30%）时默认整批阻断，
+   *  需本轮显式确认（设置页勾选 / bulkDeleteGuard=false 关闭护栏）。默认 true */
+  bulkDeleteGuard: boolean
 }
 
 export const DEFAULT_SYNC_OPTIONS: SyncOptions = {
@@ -60,6 +63,7 @@ export const DEFAULT_SYNC_OPTIONS: SyncOptions = {
   maxBackups: 10,
   pruneTombstones: true,
   hardDelete: false,
+  bulkDeleteGuard: true,
 }
 
 /** 上次同步快照：三方合并的 base（决定"谁更新"与删除传播的可信度） */
@@ -69,6 +73,12 @@ export interface SyncSnapshot {
   syncedAt: string
   /** 该 hash 来自哪台机器（决定删除传播的可信度） */
   machineId: string
+  /**
+   * 内容已同步到远端/本机，但是否**安装落盘**过：
+   * autoInstall=false 时记 false（本轮只下载未装），后续开启自动安装时
+   * 决策层据此补装；缺省（undefined）按 true 处理，兼容旧数据。
+   */
+  installed?: boolean
 }
 
 // ---------- M1 env ----------
@@ -78,8 +88,14 @@ export interface ResolvedEnv {
   dshHome: string
   /** profiles 所在目录（cordis 代）；legacy 代等同 dshHome */
   profileDir: string
-  /** skills 扫描目录 */
+  /** skills 规范目录（新下载条目的落地根；缺省为 dshHome/skills） */
   skillsDir: string
+  /**
+   * 实际存在的技能扫描根（v0.5 起多根）：按宿主 dsh-skill-filesystem 的扫描口径
+   * [dshHome/skills, agentsHome/skills, ~/.claude/skills] 探测；本机没有任何
+   * 现存根时至少包含规范目录，扫描阶段按 realpath 去重。
+   */
+  skillRoots: string[]
   /** settings.yaml 路径（cordis 代）；不存在则为 null */
   settingsFile: string | null
   /** .credentials.yaml 路径；不存在则为 null。永不参与默认同步 */
@@ -127,6 +143,11 @@ export interface RemoteEntry {
   name: string
   version: string | null
   hash: string
+  /**
+   * zip 本体的 sha256（v0.5 新增）。旧清单没有该字段——缺省时下载侧退化为
+   * 「解包后按 hash 复算目录内容校验」，仍保证内容级校验。
+   */
+  zipHash?: string
   /** 远端 zip 相对 /dsh-sync/ 的路径 */
   file: string
   size: number
@@ -188,16 +209,33 @@ export interface RemoteDirItem {
 
 export interface WebDavClient {
   testConnection(): Promise<TestConnectionResult>
+  /**
+   * 存在性判定：**只有 404/405（不存在）返回 false**；超时 / 5xx / 401/403
+   * 一律抛错。调用方必须把"读不到"与"不存在"区分开——把失败当不存在会导致
+   * 远端账本被当空清单覆盖（严重数据风险）。
+   */
   exists(remotePath: string): Promise<boolean>
   ensureDir(remotePath: string): Promise<void>
-  putFile(remotePath: string, localPath: string, opts?: { resume?: boolean }): Promise<void>
-  getFile(remotePath: string, localPath: string, opts?: { resume?: boolean }): Promise<void>
+  putFile(remotePath: string, localPath: string, opts?: { sha256?: string }): Promise<void>
+  getFile(remotePath: string, localPath: string, opts?: { expectedSize?: number; sha256?: string }): Promise<void>
   getJson<T>(remotePath: string): Promise<T | null>
-  putJsonIfMatch(remotePath: string, data: unknown, etag: string | null): Promise<string | null>
-  deleteFile(remotePath: string): Promise<void>
+  /** GET 同一响应内取 body 与 etag（消除两次请求间的 TOCTOU）；不存在返回 value=null + etag=null */
+  getWithEtag<T>(remotePath: string): Promise<{ value: T | null; etag: string | null }>
+  /**
+   * 条件写。etag 为 null 时必须给 `createOnly`（If-None-Match: *）——
+   * 两个都没有则拒绝执行（宁可失败，不可盲覆盖）。
+   */
+  putJsonIfMatch(
+    remotePath: string,
+    data: unknown,
+    etag: string | null,
+    opts?: { createOnly?: boolean },
+  ): Promise<string | null>
+  /** 删除远端对象；404 视为已删除返回 false，其余失败抛错 */
+  deleteFile(remotePath: string): Promise<boolean>
   move(remotePath: string, destPath: string): Promise<void>
   stat(remotePath: string): Promise<{ etag: string | null; size: number; mtime: string | null } | null>
-  /** 列出目录内容（prune 用；不存在返回空数组） */
+  /** 列出目录内容（prune 用；不存在返回空数组；服务端错误抛错） */
   listDir(remotePath: string): Promise<RemoteDirItem[]>
   /** 尽力而为的软锁；服务端不支持时返回 null 并降级 */
   acquireLock(machineId: string, ttlMs: number): Promise<LockHandle | null>
@@ -210,7 +248,10 @@ export interface PackedEntry {
   entry: LocalEntry
   /** 本地 zip 绝对路径（staging 目录内） */
   zipPath: string
+  /** 目录内容 hash（清单主键，含 kind/name/version 身份前缀） */
   sha256: string
+  /** zip 文件本体的 sha256（下载侧完整性校验用） */
+  zipHash: string
   size: number
 }
 
@@ -305,7 +346,7 @@ export interface MergeInputV2 {
   remote: RemoteManifest
   lastSynced: Record<string, SyncSnapshot>
   policy: ConflictPolicy
-  options: Pick<SyncOptions, 'autoResolve' | 'propagateDeletions'>
+  options: Pick<SyncOptions, 'autoResolve' | 'propagateDeletions' | 'autoInstall'>
   direction: SyncDirection
   machineId: string
 }
@@ -453,6 +494,8 @@ export interface SyncRunReport {
   deduped: string[]
   conflicts: { name: string; note: string }[]
   errors: { stage: string; message: string; name?: string }[]
+  /** 非致命告警（扫描跳过、护栏触发、降级路径等）——不计入 ok 判定 */
+  warnings: { stage: string; message: string; name?: string }[]
   items: RunItem[]
   ok: boolean
   cancelled: boolean
@@ -462,7 +505,7 @@ export interface SyncRunReport {
 }
 
 export interface SyncEngine {
-  runOnce(trigger: SyncTrigger, opts?: { runId?: string }): Promise<SyncRunReport>
+  runOnce(trigger: SyncTrigger, opts?: { runId?: string; confirmBulkDelete?: boolean }): Promise<SyncRunReport>
   /** 定时调度：intervalHours = 0 表示关闭 */
   startScheduler(intervalHours: number, onReport: (r: SyncRunReport) => void): void
   stopScheduler(): void
@@ -481,8 +524,8 @@ export interface SyncEngine {
 export interface PluginConnectionConfig {
   url: string
   username: string
-  /** 密码引用方式，不落明文 */
-  passwordRef: 'keychain' | 'credentials'
+  /** @deprecated v0.5 起固定本地凭据文件；旧配置里的该值读取后忽略 */
+  passwordRef?: 'keychain' | 'credentials'
 }
 
 /** 连接层可选参数：设置页「高级选项」里可改，也可写在 cordis.patch.yml 的 config 里 */
@@ -532,7 +575,6 @@ export interface PublicConfig {
   connection: {
     url: string
     username: string
-    passwordRef: 'keychain' | 'credentials'
     hasPassword: boolean
   }
   options: PluginOptions

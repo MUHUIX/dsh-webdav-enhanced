@@ -126,10 +126,11 @@ function harness(ctx: HttpContext) {
   )
   const route = routes[0]
 
-  async function call(method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
+  async function call(method: string, path: string, body?: unknown, headers?: Record<string, string>): Promise<{ status: number; body: any }> {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]) as unknown as IncomingMessage
     ;(req as unknown as { method: string }).method = method
     ;(req as unknown as { url: string }).url = HTTP_PREFIX + path
+    ;(req as unknown as { headers: Record<string, string> }).headers = { host: '127.0.0.1:59999', ...(headers ?? {}) }
     let status = 0
     const res = {
       writableEnded: false,
@@ -172,7 +173,7 @@ describe('http routes（DESIGN-v2 §5）', () => {
     const res = await call('POST', '/sync', { trigger: 'manual' })
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ started: true, runId: 'run-1', alreadyRunning: false })
-    expect(ctx.startSync).toHaveBeenCalledWith('manual')
+    expect(ctx.startSync).toHaveBeenCalledWith('manual', { confirmBulkDelete: false })
     // 是同步调用（提交给 ctx 后立刻返回），不是等 runSync 的 Promise
     expect(ctx.runSync).not.toHaveBeenCalled()
   })
@@ -276,5 +277,15 @@ describe('http routes（DESIGN-v2 §5）', () => {
     expect(res.status).toBe(200)
     expect(res.body.machineId).toBe('m1')
     expect(res.body.direction).toBe('both')
+  })
+
+  it('跨源请求一律 403（C-3 来源守卫）', async () => {
+    const { ctx } = mkCtx()
+    const { call } = harness(ctx)
+    const res = await call('POST', '/reset', undefined, { origin: 'http://evil.example', 'sec-fetch-site': 'cross-site' })
+    expect(res.status).toBe(403)
+    expect(res.body.error).toContain('cross-origin')
+    // 危险端点必须被拦在业务逻辑之前
+    expect(ctx.reset).not.toHaveBeenCalled()
   })
 })

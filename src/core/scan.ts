@@ -9,7 +9,7 @@
  * 容错：单个条目扫描失败不阻塞整体，记录到 errors 返回。
  */
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { collectHashableFiles, hashDirectory } from './pack.js'
 import { DATA_DIRNAME } from './config-store.js'
@@ -27,6 +27,8 @@ export const HASH_CACHE_SCHEMA = 2
 export interface ScanError {
   stage: string
   message: string
+  /** true = 告警（不进同步失败判定）；缺省 = 错误 */
+  warn?: boolean
 }
 
 export interface ScanResult {
@@ -34,7 +36,9 @@ export interface ScanResult {
   errors: ScanError[]
 }
 
-/** 目录内容指纹缓存项（DESIGN-v2 §6；filesMtimeMs 为额外安全校验，缺省视为未命中） */
+/** 目录内容指纹缓存项（DESIGN-v2 §6）
+ * v0.5：命中判定加入 treeDigest（全量"相对路径+大小+mtime"摘要）——
+ * 旧实现只比目录 mtime/文件数/最大文件 mtime，会漏掉"改了非最新文件"的修改（M-1）。 */
 export interface HashCacheEntry {
   /** 缓存 schema 版本：与 HASH_CACHE_SCHEMA 不一致视为未命中（排除表/hash 算法升级后自动失效） */
   schema?: number
@@ -42,8 +46,10 @@ export interface HashCacheEntry {
   fileCount: number
   hash: string
   sizeBytes: number
-  /** 目录内文件的最新 mtime（防止"只改文件内容不改目录 mtime"误命中） */
+  /** 目录内文件的最新 mtime（保留字段，兼容旧缓存文件） */
   filesMtimeMs?: number
+  /** 全量文件清单摘要：sha256 over sorted(rel|size|mtimeMs) */
+  treeDigest?: string
 }
 
 /** 位于 $DSH_HOME/.webdav-enhanced/hash-cache.json 的内容 hash 缓存 */
@@ -53,7 +59,8 @@ export class HashCache {
   private dirty = false
 
   constructor(dshHome: string) {
-    this.filePath = path.join(dshHome || '.', DATA_DIRNAME, HASH_CACHE_FILENAME)
+    if (!dshHome) throw new Error('HashCache: dshHome is required (v0.5: 禁止回退到进程 CWD)')
+    this.filePath = path.join(dshHome, DATA_DIRNAME, HASH_CACHE_FILENAME)
   }
 
   get(key: string): HashCacheEntry | null {
@@ -157,6 +164,8 @@ interface DirFingerprint {
   fileCount: number
   filesMtimeMs: number
   sizeBytes: number
+  /** 全量 "rel|size|mtimeMs" 排序拼接后的 sha256 */
+  treeDigest: string
 }
 
 async function fingerprintDir(dir: string): Promise<DirFingerprint | null> {
@@ -165,13 +174,20 @@ async function fingerprintDir(dir: string): Promise<DirFingerprint | null> {
   const files = await collectHashableFiles(dir)
   let latest = 0
   let size = 0
-  for (const rel of files) {
+  const h = createHash('sha256')
+  for (const rel of [...files].sort()) {
     const fst = statOrNull(path.join(dir, rel))
     if (!fst) continue
     if (fst.mtimeMs > latest) latest = fst.mtimeMs
     size += fst.size
+    h.update(rel)
+    h.update('|')
+    h.update(String(fst.size))
+    h.update('|')
+    h.update(String(Math.round(fst.mtimeMs)))
+    h.update('\0')
   }
-  return { mtimeMs: st.mtimeMs, fileCount: files.length, filesMtimeMs: latest, sizeBytes: size }
+  return { mtimeMs: st.mtimeMs, fileCount: files.length, filesMtimeMs: latest, sizeBytes: size, treeDigest: h.digest('hex') }
 }
 
 /** 扫描期回填真实 hash / sizeBytes（D1 + D2 根因修复） */
@@ -191,7 +207,8 @@ async function fillHash(entry: LocalEntry, cache: HashCache | null, errors: Scan
     cached &&
     cached.mtimeMs === fp.mtimeMs &&
     cached.fileCount === fp.fileCount &&
-    cached.filesMtimeMs === fp.filesMtimeMs
+    typeof cached.treeDigest === 'string' &&
+    cached.treeDigest === fp.treeDigest
   ) {
     entry.hash = cached.hash
     entry.sizeBytes = cached.sizeBytes
@@ -206,6 +223,7 @@ async function fillHash(entry: LocalEntry, cache: HashCache | null, errors: Scan
       hash: entry.hash,
       sizeBytes: entry.sizeBytes,
       filesMtimeMs: fp.filesMtimeMs,
+      treeDigest: fp.treeDigest,
     })
     return true
   } catch (err) {
@@ -217,11 +235,15 @@ async function fillHash(entry: LocalEntry, cache: HashCache | null, errors: Scan
 interface PkgJson {
   name?: string
   version?: string
-  dsh?: { bundle?: boolean }
+  dsh?: { bundle?: boolean; profile?: { bundles?: string[] } }
   dependencies?: Record<string, string>
 }
 
-/** 解析 profile 已装的 bundle 列表 + 本地路径 */
+/**
+ * 解析 profile 已装的 bundle 列表 + 本地路径。
+ * v0.5（L-3）：只同步「带 dsh.bundle 标记」或「出现在 profile 的 dsh.profile.bundles
+ * 列表里」的依赖——与 README 宣称一致；纯传递依赖（react 之类）不再被当成插件扫走。
+ */
 async function scanBundles(
   env: ResolvedEnv,
   scope: SyncScope['bundles'],
@@ -233,7 +255,9 @@ async function scanBundles(
   const profilePkg = path.join(env.profileDir, 'package.json')
   const pkg = safeReadJson<PkgJson>(profilePkg)
   if (!pkg?.dependencies) return out
+  const declaredBundles = new Set(pkg.dsh?.profile?.bundles ?? [])
   const exclude = new Set(scope.exclude)
+  const seenDirs = new Set<string>()
   for (const [name, spec] of Object.entries(pkg.dependencies)) {
     if (exclude.has(name)) continue
     // link:/file: → 本地路径；npm/git spec → node_modules 下
@@ -245,10 +269,14 @@ async function scanBundles(
       if (existsSync(nm)) sourceDir = nm
     }
     if (!sourceDir || !existsSync(sourceDir)) {
-      errors.push({ stage: 'scan-bundle', message: `bundle ${name} spec ${spec} cannot be resolved locally` })
+      errors.push({ stage: 'scan-bundle', message: `bundle ${name} spec ${spec} cannot be resolved locally`, warn: true })
       continue
     }
     const bundlesPkgJson = safeReadJson<PkgJson>(path.join(sourceDir, 'package.json'))
+    if (bundlesPkgJson?.dsh?.bundle !== true && !declaredBundles.has(name)) continue // 非 bundle：跳过
+    const dirKey = realpathOrNull(sourceDir) ?? path.resolve(sourceDir)
+    if (seenDirs.has(dirKey)) continue // 同一物理目录被重复声明：只保留第一条
+    seenDirs.add(dirKey)
     const entry: LocalEntry = {
       kind: 'bundle',
       name,
@@ -263,6 +291,14 @@ async function scanBundles(
   return out
 }
 
+function realpathOrNull(p: string): string | null {
+  try {
+    return realpathSync(p)
+  } catch {
+    return null
+  }
+}
+
 async function scanSkills(
   env: ResolvedEnv,
   scope: SyncScope['skills'],
@@ -270,27 +306,47 @@ async function scanSkills(
   cache: HashCache | null,
 ): Promise<LocalEntry[]> {
   const out: LocalEntry[] = []
-  if (scope.mode === 'none' || !existsSync(env.skillsDir)) return out
+  if (scope.mode === 'none') return out
   const exclude = new Set(scope.exclude)
-  for (const name of safeReaddir(env.skillsDir)) {
-    if (exclude.has(name)) continue
-    if (name.startsWith('.')) continue
-    const dir = path.join(env.skillsDir, name)
-    if (!existsSync(dir)) continue
-    if (!isSkillDir(dir)) {
-      errors.push({ stage: 'scan-skill', message: `skill dir ${name} missing SKILL.md, skipped` })
-      continue
+  const seenByName = new Map<string, string>() // name → 命中根（realpath）
+  const seenReal = new Set<string>()
+  const roots = env.skillRoots && env.skillRoots.length > 0 ? env.skillRoots : [env.skillsDir]
+  for (const root of roots) {
+    if (!root || !existsSync(root)) continue
+    for (const name of safeReaddir(root)) {
+      if (exclude.has(name)) continue
+      if (name.startsWith('.')) continue
+      const dir = path.join(root, name)
+      if (!existsSync(dir)) continue
+      const real = realpathOrNull(dir) ?? path.resolve(dir)
+      if (seenReal.has(real)) continue // 同一物理目录（如 junction 镜像）只算一次
+      if (!isSkillDir(dir)) {
+        errors.push({ stage: 'scan-skill', message: `skill dir ${name} missing SKILL.md, skipped`, warn: true })
+        continue
+      }
+      const collision = seenByName.get(name)
+      if (collision && collision !== real) {
+        // 多根同名不同目录：以第一个根为准，另一个显式告警（v0.4 是静默塌缩）
+        errors.push({
+          stage: 'scan-skill',
+          message: `skill "${name}" 同时存在于多个根目录，保留 ${roots[0]} 下的版本，忽略 ${dir}`,
+          warn: true,
+        })
+        continue
+      }
+      seenByName.set(name, real)
+      seenReal.add(real)
+      const entry: LocalEntry = {
+        kind: 'skill',
+        name,
+        version: guessSkillVersion(dir),
+        sourceDir: dir,
+        hash: '',
+        sizeBytes: 0,
+        modifiedAt: dirMtime(dir),
+      }
+      if (await fillHash(entry, cache, errors)) out.push(entry)
     }
-    const entry: LocalEntry = {
-      kind: 'skill',
-      name,
-      version: guessSkillVersion(dir),
-      sourceDir: dir,
-      hash: '',
-      sizeBytes: 0,
-      modifiedAt: dirMtime(dir),
-    }
-    if (await fillHash(entry, cache, errors)) out.push(entry)
   }
   return out
 }
@@ -299,6 +355,9 @@ async function scanSkills(
 
 /** 敏感顶层 key：整段跳过（apiKey / apiKeyEnv / credentials / token / secret / password…） */
 const SENSITIVE_KEY = /(api[-_]?key|token|secret|password|passwd|credential|authorization|private[-_]?key)/i
+
+/** 块内字段级敏感行（v0.5，H-7）：providers:/llm: 这类非敏感块里的 apiKey 行 */
+const SENSITIVE_FIELD = /^\s*[\w"']*(api[-_]?key|token|secret|passwd|password|credential|authorization|private[-_]?key)[\w"']*\s*:/i
 
 /** YAML 顶层 key 行（列 0、非注释） */
 const TOP_KEY = /^([A-Za-z_][\w.-]*)\s*:/
@@ -331,6 +390,43 @@ export function listConfigTopKeys(raw: string): string[] {
   return splitConfigBlocks(raw)
     .map((b) => b.key)
     .filter((key) => !SENSITIVE_KEY.test(key))
+}
+
+/**
+ * 块内字段级脱敏（v0.5，H-7）：剔除敏感 key 行及其更深缩进的子块。
+ * 返回 { lines, dropped }——dropped>0 时调用方必须往 warnings 记数，
+ * 用户要知道"有几行密钥被拦下了"，而不是密钥悄悄不上云 / 或根本没拦。
+ */
+export function redactSensitiveLines(block: ConfigBlock): { lines: string[]; dropped: number } {
+  const kept: string[] = [block.lines[0]] // 顶层 key 行本身（已过 SENSITIVE_KEY 筛选）
+  const baseIndent = leadingSpace(block.lines[0] ?? '')
+  let dropping = false
+  let dropIndent = 0
+  let dropped = 0
+  for (const line of block.lines.slice(1)) {
+    const indent = leadingSpace(line)
+    const isContent = line.trim() !== ''
+    if (dropping) {
+      if (!isContent || indent > dropIndent) {
+        dropped += isContent ? 1 : 0
+        continue // 仍在被剔除的子块内（含其空行分隔）
+      }
+      dropping = false
+    }
+    if (isContent && indent > baseIndent && SENSITIVE_FIELD.test(line)) {
+      dropping = true
+      dropIndent = indent
+      dropped += 1
+      continue
+    }
+    kept.push(line)
+  }
+  return { lines: kept, dropped }
+}
+
+function leadingSpace(line: string): number {
+  const m = line.match(/^(\s*)/)
+  return m ? m[1].length : 0
 }
 
 /** 选出要同步的 config 顶层 key */
@@ -375,10 +471,24 @@ function scanConfigs(env: ResolvedEnv, scope: SyncScope['configs'], errors: Scan
   }
   const keys = new Set(selectConfigKeys(scope.mode, scope.includeKeys, raw))
   if (keys.size === 0) return []
-  const kept = splitConfigBlocks(raw).filter((b) => keys.has(b.key))
+  let redactedCount = 0
+  const kept = splitConfigBlocks(raw)
+    .filter((b) => keys.has(b.key))
+    .map((b) => {
+      const r = redactSensitiveLines(b)
+      redactedCount += r.dropped
+      return { key: b.key, lines: r.lines }
+    })
   if (kept.length === 0) return []
+  if (redactedCount > 0) {
+    errors.push({
+      stage: 'scan-config-redact',
+      message: `配置同步：${redactedCount} 行敏感字段（apiKey/token/secret 等）已被拦下，不参与上云`,
+      warn: true,
+    })
+  }
   const stubContent = kept.map((b) => b.lines.join('\n')).join('\n') + '\n'
-  const stubDir = path.join(env.dshHome || '.', DATA_DIRNAME, 'config-stub')
+  const stubDir = path.join(env.dshHome, DATA_DIRNAME, 'config-stub')
   if (opts.writeStub) {
     try {
       mkdirSync(stubDir, { recursive: true })

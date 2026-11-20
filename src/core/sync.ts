@@ -8,14 +8,14 @@
  * - 定时调度 intervalHours（0=关），setInterval 已 unref，不影响宿主进程退出。
  */
 import { cp, mkdir, mkdtemp, rename, rm } from 'node:fs/promises'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { conflictCopyName, filterByScope, planDecisions } from './merge.js'
 import { scanLocal, machineInfo, HashCache } from './scan.js'
 import { createInstallerFromOptions, pruneBackupDir } from './install.js'
-import { createPackager } from './pack.js'
+import { createPackager, hashDirectory } from './pack.js'
 import { deleteEntry, pushEntry, pruneRemote, type SyncStore } from './webdav-store.js'
-import { emptyManifest } from './manifest.js'
 import { RunLogger } from './runlog.js'
 import { generateRunId, phaseForAction, RunProgressTracker } from './progress.js'
 import { DATA_DIRNAME, type ConfigStore } from './config-store.js'
@@ -32,7 +32,6 @@ import {
   type Packager,
   type PluginConfig,
   type RemoteEntry,
-  type RemoteManifest,
   type ResolvedEnv,
   type RunItem,
   type RunProgress,
@@ -56,6 +55,16 @@ export interface SyncEngineDeps {
   logger?: RunLogger
   /** 测试用：临时目录根 */
   tempRoot?: string
+  /**
+   * v0.5（H-12）：bundle 自动安装入口（宿主注入 pluginManager.installBundle）。
+   * 不提供则 bundle 下载后落 manual-needed——绝不 shell 出去。
+   */
+  installBundleDir?: (dir: string) => Promise<{ ok: boolean; message?: string }>
+  /**
+   * v0.5（H-12）：定时调度复用 host 层互斥。提供时 startScheduler 每跳
+   * 走它而不是直接 runOnce（否则定时同步绕过 runtime.running 互斥）。
+   */
+  scheduledTrigger?: (trigger: SyncTrigger) => Promise<SyncRunReport>
 }
 
 const TRIGGER_LABELS: Record<SyncTrigger, string> = {
@@ -95,6 +104,7 @@ export function normalizeSyncOptions(raw: Partial<SyncOptions> | undefined): Syn
     maxBackups: 10,
     pruneTombstones: true,
     hardDelete: false,
+    bulkDeleteGuard: true,
   }
   const merged = { ...base, ...(raw ?? {}) }
   if (typeof merged.maxBackups !== 'number' || !Number.isFinite(merged.maxBackups) || merged.maxBackups < 0) {
@@ -119,6 +129,7 @@ export function createBusyReport(runId: string, trigger: SyncTrigger): SyncRunRe
     deduped: [],
     conflicts: [],
     errors: [{ stage: 'run', message: '同步任务已在运行中' }],
+    warnings: [],
     items: [],
     ok: false,
     cancelled: false,
@@ -141,6 +152,7 @@ function emptyReport(runId: string, trigger: SyncTrigger, startedAt: string): Sy
     deduped: [],
     conflicts: [],
     errors: [],
+    warnings: [],
     items: [],
     ok: false,
     cancelled: false,
@@ -159,7 +171,7 @@ interface Outcome {
   detail?: string
   bytes?: number
   /** 本轮真正写成功的内容 hash → 记入 lastSynced（D1） */
-  synced?: { hash: string; version: string | null }
+  synced?: { hash: string; version: string | null; installed?: boolean }
   /** 该 key 从 lastSynced 移除（删除传播完成） */
   remove?: boolean
   /** bundle 安装成功待重启 */
@@ -185,6 +197,7 @@ export class SyncEngineImpl implements SyncEngine {
   private lastReportValue: SyncRunReport | null = null
   private syncedThisRun: Record<string, SyncSnapshot> = {}
   private removedThisRun: string[] = []
+  private bulkConfirm = false
   private readonly packager: Packager
   private readonly tracker: RunProgressTracker
   private readonly logger: RunLogger
@@ -200,12 +213,15 @@ export class SyncEngineImpl implements SyncEngine {
   }
 
   private dataDir(): string {
-    return path.join(this.deps.env.dshHome || '.', DATA_DIRNAME)
+    // v0.5（M-10）：数据根只认解析出的 dshHome；解析不出来直接抛，
+    // 绝不把 backups/staging/日志写进宿主进程 CWD。
+    if (!this.deps.env.dshHome) throw new Error('dshHome 未解析：拒绝在未知数据根下写入')
+    return path.join(this.deps.env.dshHome, DATA_DIRNAME)
   }
 
   // ---------- run ----------
 
-  async runOnce(trigger: SyncTrigger, opts: { runId?: string } = {}): Promise<SyncRunReport> {
+  async runOnce(trigger: SyncTrigger, opts: { runId?: string; confirmBulkDelete?: boolean } = {}): Promise<SyncRunReport> {
     const startedAt = nowIso()
     if (this.running) {
       return createBusyReport(opts.runId ?? this.currentRun ?? generateRunId(), trigger)
@@ -215,6 +231,7 @@ export class SyncEngineImpl implements SyncEngine {
     this.currentRun = runId
     this.syncedThisRun = {}
     this.removedThisRun = []
+    this.bulkConfirm = opts.confirmBulkDelete === true
     this.tracker.start({ runId, trigger })
     const report = emptyReport(runId, trigger, startedAt)
     this.logger.info('sync', `开始同步（${triggerLabel(trigger)}）`, { runId })
@@ -253,58 +270,79 @@ export class SyncEngineImpl implements SyncEngine {
     const cfg = this.cfg()
     const options = normalizeSyncOptions(cfg.syncOptions)
     const direction = cfg.schedule.direction
-    const installer = this.deps.installer ?? createInstallerFromOptions(this.deps.env, options)
 
-    // 1) 尽力持锁：拿不到也继续（manifest 条件写兜底），并发由 host 层互斥保证
-    try {
-      const lock = await this.deps.store.acquireLock(cfg.machineId, 10 * 60 * 1000)
-      if (lock) await lock.release().catch(() => undefined)
-      if (!lock) this.logger.info('sync', '未获得远端锁，按无锁模式继续（manifest 条件写兜底）', { runId: report.runId })
-    } catch (err) {
-      this.logger.warn('sync', `获取远端锁失败（继续执行）：${errMsg(err)}`, { runId: report.runId })
-    }
+    // 0) 本轮远端清单缓存复位（v0.5：N 条目不再 N×(2 GET)）
+    this.deps.store.beginRun()
 
     const tmpRoot = await mkdtemp(path.join(this.deps.tempRoot ?? tmpdir(), 'dsh-sync-'))
     try {
-      // 2) 扫描（v2：扫描期就算真实 hash，D1/D2）
+      // 1) 扫描（v2：扫描期就算真实 hash，D1/D2）
       this.tracker.phase('scan', '正在扫描本地条目')
-      const scanErrors: { stage: string; message: string }[] = []
-      const localEntries = await scanLocal(this.deps.env, cfg.scope, scanErrors, {
-        cache: new HashCache(this.deps.env.dshHome || tmpdir()),
+      const scanIssues: { stage: string; message: string; warn?: boolean }[] = []
+      const localEntries = await scanLocal(this.deps.env, cfg.scope, scanIssues, {
+        cache: this.deps.env.dshHome ? new HashCache(this.deps.env.dshHome) : null,
       })
-      for (const e of scanErrors) {
-        report.errors.push(e)
-        this.logger.warn('sync', `扫描告警：${e.message}`, { runId: report.runId })
+      for (const e of scanIssues) {
+        if (e.warn) {
+          report.warnings.push({ stage: e.stage, message: e.message })
+          this.logger.warn('sync', `扫描告警：${e.message}`, { runId: report.runId })
+        } else {
+          report.errors.push({ stage: e.stage, message: e.message })
+          this.logger.warn('sync', `扫描错误：${e.message}`, { runId: report.runId })
+        }
       }
       const self = machineInfo(this.deps.env, cfg.machineId)
       for (const e of localEntries) e.machine = self
       this.logger.info('sync', `本地扫描完成：${localEntries.length} 个条目`, { runId: report.runId })
       if (this.checkCancel(report)) return
 
-      // 3) 读远端清单
+      // 2) 读远端清单。store.read 现在**不会**把失败伪装成空清单：
+      //    任何非 404 的读取失败 / 结构非法 → 上抛，本轮直接终止（C-4 修复）。
       this.tracker.phase('manifest', '正在读取远端清单')
-      const { manifest } = await this.deps.store.read()
-      const remote: RemoteManifest = manifest ?? emptyManifest()
+      const { manifest: remote, dropped } = await this.deps.store.read()
+      for (const d of dropped) {
+        report.warnings.push({ stage: 'manifest-validate', message: `远端清单条目 ${d.name} 非法已忽略：${d.why}` })
+      }
       const alive = remote.entries.filter((e) => !e.deleted).length
       this.logger.info('sync', `远端清单：${alive} 个条目（墓碑 ${remote.entries.length - alive} 个）`, {
         runId: report.runId,
       })
       if (this.checkCancel(report)) return
 
-      // 4) 三方合并 + 方向过滤 + 同步范围过滤
+      // installer：每轮构造，带 link 保护名单与宿主安装入口
+      const linkSourceDirs = localEntries
+        .filter((e) => e.kind === 'bundle' && !this.isManagedLocalPath(e.sourceDir))
+        .map((e) => e.sourceDir)
+      const installer =
+        this.deps.installer ??
+        createInstallerFromOptions(this.deps.env, options, {
+          installBundleDir: this.deps.installBundleDir,
+          linkSourceDirs,
+        })
+
+      // 3) 三方合并 + 方向过滤 + 同步范围过滤
       this.tracker.phase('plan', '正在生成同步计划')
-      const decisions = filterByScope(
+      let decisions = filterByScope(
         planDecisions({
           local: localEntries,
           remote,
           lastSynced: cfg.lastSynced ?? {},
           policy: cfg.conflictPolicy,
-          options: { autoResolve: options.autoResolve, propagateDeletions: options.propagateDeletions },
+          options: {
+            autoResolve: options.autoResolve,
+            propagateDeletions: options.propagateDeletions,
+            autoInstall: options.autoInstall,
+          },
           direction,
           machineId: cfg.machineId,
         }),
         cfg.scope,
       )
+
+      // 3.5) 批量删除护栏（C-4/C-5 兜底）：一轮内 delete-local 数量异常多
+      //      几乎必然是"远端读残/被覆盖"，未经确认整批阻断。
+      decisions = this.applyBulkDeleteGuard(decisions, alive, report)
+
       this.tracker.setItems(
         decisions.map((d) => ({
           key: d.key,
@@ -327,7 +365,7 @@ export class SyncEngineImpl implements SyncEngine {
       }
       if (this.tracker.isCancelRequested()) report.cancelled = true
 
-      // 5) prune：清理超期 trash（hardDelete 时连墓碑一起物理删）
+      // 4) prune：清理超期 trash（hardDelete 时连墓碑一起物理删）
       if (!report.cancelled && options.pruneTombstones) {
         this.tracker.phase('prune', '正在清理远端回收站')
         try {
@@ -341,17 +379,66 @@ export class SyncEngineImpl implements SyncEngine {
               { runId: report.runId },
             )
           }
+          if (pruned.trashUnknownAge > 0) {
+            report.warnings.push({
+              stage: 'prune',
+              message: `回收站有 ${pruned.trashUnknownAge} 个文件无法判定年龄，本轮保留（不冒险删除）`,
+            })
+          }
         } catch (err) {
           // prune 失败只记警告，不影响本轮结果
           this.logger.warn('prune', `远端清理失败（不影响本轮结果）：${errMsg(err)}`, { runId: report.runId })
         }
       }
 
-      // 6) finalize
+      // 5) finalize
       this.tracker.phase('finalize', '正在保存同步状态')
     } finally {
       await rm(tmpRoot, { recursive: true, force: true }).catch(() => undefined)
     }
+  }
+
+  /**
+   * 删除传播的本地侧护栏（v0.5）。触发条件（bulkDeleteGuard=true 且本轮未确认）：
+   * delete-local 决策 > 3 条 且 > 远端存活数的 30%。被阻断的条目转 skipped 并记 error，
+   * 提示用户在设置页「危险区」旁确认或调整护栏开关。
+   */
+  private applyBulkDeleteGuard(
+    decisions: MergeDecisionV2[],
+    remoteAlive: number,
+    report: SyncRunReport,
+  ): MergeDecisionV2[] {
+    const toDelete = decisions.filter((d) => d.action === 'delete-local')
+    if (toDelete.length === 0) return decisions
+    const threshold = Math.max(3, Math.ceil(remoteAlive * 0.3))
+    if (!this.bulkConfirm && toDelete.length > threshold) {
+      report.errors.push({
+        stage: 'bulk-delete-guard',
+        message: `本轮将删除本机 ${toDelete.length} 个条目（阈值 ${threshold}），已整批阻断。若确属预期（例如刚重置远端），请确认后重跑并携带 confirmBulkDelete`,
+      })
+      return decisions.map((d) =>
+        d.action === 'delete-local'
+          ? { ...d, action: 'skip' as const, winner: undefined, reason: '批量删除护栏：本轮已阻断，等待确认' }
+          : d,
+      )
+    }
+    return decisions
+  }
+
+  /** sourceDir 是否处于"本插件可管理"的本地根内（profileDir/node_modules 或任一 skillRoot） */
+  private isManagedLocalPath(sourceDir: string): boolean {
+    const env = this.deps.env
+    if (!sourceDir) return false
+    const roots = [
+      env.profileDir ? path.join(env.profileDir, 'node_modules') : '',
+      env.skillsDir,
+      ...(env.skillRoots ?? []),
+    ].filter(Boolean)
+    const abs = path.resolve(sourceDir)
+    return roots.some((r) => {
+      const root = path.resolve(r)
+      return abs === root || abs.startsWith(root + path.sep)
+    })
   }
 
   private checkCancel(report: SyncRunReport): boolean {
@@ -425,12 +512,14 @@ export class SyncEngineImpl implements SyncEngine {
       report.needsRestart.push(d.key)
     }
     if (outcome.synced) {
-      this.syncedThisRun[d.key] = {
+      const snap: SyncSnapshot = {
         hash: outcome.synced.hash,
         version: outcome.synced.version,
         syncedAt: new Date().toISOString(),
         machineId: ctx.cfg.machineId,
       }
+      if (outcome.synced.installed === false) snap.installed = false
+      this.syncedThisRun[d.key] = snap
     }
     if (outcome.remove) this.removedThisRun.push(d.key)
     if (outcome.error) {
@@ -557,6 +646,7 @@ export class SyncEngineImpl implements SyncEngine {
         name: entry.name,
         version: entry.version,
         hash: packed.sha256,
+        zipHash: packed.zipHash,
         size: packed.size,
         source: machineInfo(this.deps.env, ctx.cfg.machineId) as MachineInfo,
       },
@@ -601,9 +691,31 @@ export class SyncEngineImpl implements SyncEngine {
   private async applyDownload(d: MergeDecisionV2, ctx: RunContext): Promise<Outcome> {
     const remote = d.remote!
     const zipPath = path.join(ctx.tmpRoot, `dl-${sanitize(remote.name)}-${remote.hash.slice(0, 8)}.zip`)
-    await this.deps.client.getFile(remote.file, zipPath)
+    // 1) 下载并校验 zip 本体（v0.5，H-8：README 的"下载后逐份校验"从宣称变成实现；
+    //    旧清单无 zipHash → 退化为体积校验 + 第 3 步的内容 hash 复核）
+    await this.deps.client.getFile(remote.file, zipPath, {
+      expectedSize: remote.size,
+      sha256: remote.zipHash,
+    })
+    // 2) 解包（护栏：路径穿越 / 实际字节计数 / 条目数）
     const unpackDir = path.join(ctx.tmpRoot, `unpack-${sanitize(remote.kind)}-${sanitize(remote.name)}`)
     const meta = await this.packager.unpack(zipPath, unpackDir, DEFAULT_SAFETY_GUARD)
+    // 3) 内容 hash 复核：解包目录按清单身份重算，必须等于 remote.hash——
+    //    这同时兜住了"无 zipHash 的旧包"与"清单被篡改指向别的文件"两类风险
+    if (remote.hash && /^[0-9a-f]{64}$/.test(remote.hash)) {
+      const recomputed = await hashDirectory({ kind: remote.kind, name: remote.name, version: remote.version, sourceDir: unpackDir })
+      if (recomputed !== remote.hash) {
+        throw new Error(`内容 hash 复核失败：${remote.name}（解包内容与清单不符，拒绝安装）`)
+      }
+    }
+    // 4) 身份交叉校验 + 按**清单侧 kind** 路由（不信包内自述）
+    if (meta.kind !== remote.kind || meta.name !== remote.name) {
+      return {
+        status: 'failed',
+        category: 'download',
+        error: `包内 _meta（${meta.kind}:${meta.name}）与清单条目（${remote.kind}:${remote.name}）不符，已拒绝安装`,
+      }
+    }
     const packed: PackedEntry = {
       entry: {
         kind: remote.kind,
@@ -616,13 +728,16 @@ export class SyncEngineImpl implements SyncEngine {
       },
       zipPath,
       sha256: remote.hash,
+      zipHash: remote.zipHash ?? '',
       size: remote.size,
     }
     if (!ctx.options.autoInstall) {
+      // M-15：登记"已同步未安装"，开启自动安装后由决策层补装，不再每轮重复下载
       return {
         status: 'skipped',
         category: 'download',
         bytes: remote.size,
+        synced: { hash: remote.hash, version: remote.version, installed: false },
         reason: `${d.reason}；已下载但 autoInstall 关闭，未安装`,
         detail: `临时包：${zipPath}`,
       }
@@ -738,6 +853,16 @@ export class SyncEngineImpl implements SyncEngine {
         detail: '如需删除请手动编辑 settings.yaml（同步前已备份原值）',
       }
     }
+    // v0.5（C-5）：只允许删除"本插件管理范围内"的目录——profile 的
+    // node_modules 子树或技能根。link 安装的 bundle 是开发者工作区，
+    // 绝不允许被一次误判整目录搬走。
+    if (!this.isManagedLocalPath(entry.sourceDir)) {
+      return {
+        status: 'failed',
+        category: 'delete',
+        error: `拒绝删除：${entry.name} 的目录不在 profile/skills 管理范围内（疑似 link 安装的开发目录）：${entry.sourceDir}`,
+      }
+    }
     const bakDir = path.join(this.dataDir(), 'backups', plural(entry.kind), conflictCopyName(entry.name, ctx.cfg.machineId))
     await mkdir(path.dirname(bakDir), { recursive: true })
     let detail: string
@@ -798,10 +923,25 @@ export class SyncEngineImpl implements SyncEngine {
   // ---------- 备份 ----------
 
   private async backupLocalEntry(entry: LocalEntry, ctx: RunContext): Promise<string> {
+    // v0.5（M-7）：同一 kind/name 若已有"同内容"的备份，本轮不再重复打包——
+    // ask/manual 冲突每轮重演不会把备份目录刷爆，也不会挤掉别的条目的副本
+    const seenPath = path.join(this.dataDir(), 'backups', plural(entry.kind), `.${sanitize(entry.name)}.last-backuped`)
+    try {
+      if (existsSync(seenPath) && readFileSync(seenPath, 'utf8').trim() === entry.hash) {
+        return '（同内容本机版本此前已备份，本轮跳过）'
+      }
+    } catch {
+      /* 标记读失败按未备份处理 */
+    }
     const dir = path.join(this.dataDir(), 'backups', plural(entry.kind), conflictCopyName(entry.name, ctx.cfg.machineId))
     await mkdir(dir, { recursive: true })
     const packed = await this.packager.pack(entry, dir)
     this.rotateBackups(entry.kind, ctx.options.maxBackups)
+    try {
+      writeFileSync(seenPath, entry.hash, 'utf8')
+    } catch {
+      /* 尽力而为 */
+    }
     return packed.zipPath
   }
 
@@ -820,10 +960,13 @@ export class SyncEngineImpl implements SyncEngine {
   }
 
   private async applyByKind(meta: PackMeta, packed: PackedEntry, installer: Installer) {
-    if (meta.kind === 'bundle') return installer.applyBundle(packed, meta)
-    if (meta.kind === 'skill') return installer.applySkill(packed, meta)
-    if (meta.kind === 'config') return installer.applyConfig(packed, meta)
-    return { status: 'failed' as const, message: `unknown kind: ${meta.kind}` }
+    // 路由按**清单侧 kind**（packed.entry.kind，已在 applyDownload 与 _meta 交叉校验），
+    // 不再采信包内自述的 meta.kind（C-1：防 kind 伪造换安装通道）
+    const kind = packed.entry.kind
+    if (kind === 'bundle') return installer.applyBundle(packed, meta)
+    if (kind === 'skill') return installer.applySkill(packed, meta)
+    if (kind === 'config') return installer.applyConfig(packed, meta)
+    return { status: 'failed' as const, message: `unknown kind: ${String(kind)}` }
   }
 
   // ---------- 持久化 ----------
@@ -845,7 +988,9 @@ export class SyncEngineImpl implements SyncEngine {
     const ms = Math.max(60_000, intervalHours * 60 * 60 * 1000)
     this.timer = setInterval(() => {
       if (this.running) return
-      void this.runOnce('scheduled')
+      const kickoff = (): Promise<SyncRunReport> =>
+        this.deps.scheduledTrigger ? this.deps.scheduledTrigger('scheduled') : this.runOnce('scheduled')
+      void kickoff()
         .then((r) => {
           try {
             onReport(r)
