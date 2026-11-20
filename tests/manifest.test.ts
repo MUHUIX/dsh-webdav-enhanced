@@ -72,14 +72,26 @@ describe('manifest', () => {
 
   it('isSafeEntryName / isSafeRemoteFile 边界', () => {
     expect(isSafeEntryName('dsh-webdav-enhanced')).toBe(true)
+    // v0.5 真机验证发现的回归：npm scope 包名必须放行（曾因未处理 '/' 被误杀）
+    expect(isSafeEntryName('@hytime/dsh-thinking-effort')).toBe(true)
+    expect(isSafeEntryName('@michengai/dsh-archive-manager')).toBe(true)
     expect(isSafeEntryName('../../etc')).toBe(false)
-    expect(isSafeEntryName('a/b')).toBe(false)
+    expect(isSafeEntryName('a/b')).toBe(false) // 非 scope 的裸斜杠仍拒
+    expect(isSafeEntryName('@a/b/c')).toBe(false) // scope 只允许一段 org
+    expect(isSafeEntryName('@/x')).toBe(false)
     expect(isSafeEntryName('C:\\x')).toBe(false)
     expect(isSafeEntryName('')).toBe(false)
     expect(isSafeRemoteFile('skills/a@1-deadbeef.zip')).toBe(true)
+    expect(isSafeRemoteFile('bundles/@hytime_pkg@1-deadbeef.zip')).toBe(true)
     expect(isSafeRemoteFile('bundles/../escape.zip')).toBe(false)
     expect(isSafeRemoteFile('/abs/x.zip')).toBe(false)
     expect(isSafeRemoteFile('trash/x.zip')).toBe(false) // 只允许三个已知子目录
+  })
+
+  it('remoteZipRelPath 把 scope 名的斜杠压平，不凭空造远端子目录', () => {
+    const p = remoteZipRelPath({ kind: 'bundle', name: '@hytime/dsh-thinking-effort', version: '0.3.12', hash: 'f'.repeat(64) })
+    expect(p).toBe('bundles/@hytime_dsh-thinking-effort@0.3.12-' + 'f'.repeat(64) + '.zip')
+    expect(p.split('/').length).toBe(2) // 仅 bundles/ + 文件名
   })
 
   it('validateRemoteManifest：坏条目丢弃、版本拒读、结构容错', () => {

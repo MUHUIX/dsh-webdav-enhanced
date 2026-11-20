@@ -47,7 +47,7 @@
   },
   "engines": {
     "node": ">=24.9",
-    "dsh": ">=0.2.2 <1"
+    "dsh": ">=0.2.2-rc.0 <1"
   },
   "dependencies": {
     "archiver": "^7.0.1",

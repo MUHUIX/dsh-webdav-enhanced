@@ -113,15 +113,16 @@ export function markDeleted(manifest: RemoteManifest, kind: RemoteEntry['kind'],
 
 // ---------- 远端文件命名 ----------
 
-/** 条目名安全白名单：字母数字开头，允许 . _ -，禁路径分隔符与 `..`（远端数据入库前必查） */
+/**
+ * 条目名安全白名单：字母数字开头，允许 . _ -；npm scope 名（@org/pkg）逐段校验。
+ * 禁 `..`、禁路径分隔符出现在段内（scope 的唯一一个 `/` 是结构本身）。
+ */
 export function isSafeEntryName(name: unknown): name is string {
-  return (
-    typeof name === 'string' &&
-    name.length > 0 &&
-    name.length <= 120 &&
-    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) &&
-    !name.includes('..')
-  )
+  if (typeof name !== 'string' || name.length === 0 || name.length > 120) return false
+  const segments = name.startsWith('@') ? name.slice(1).split('/') : name.split('/')
+  if (segments.length > (name.startsWith('@') ? 2 : 1)) return false
+  if (segments.some((s) => s === '' || s === '.' || s === '..')) return false
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(segments[0]) && segments.every((s) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(s))
 }
 
 /** 远端相对路径安全：分段的 zip 路径，必须落在已知子目录下，禁 `..` 与绝对路径 */
@@ -139,7 +140,9 @@ export function remoteZipRelPath(e: Pick<RemoteEntry, 'kind' | 'name' | 'version
   const hash = /^[0-9a-f]{64}$/.test(e.hash) ? e.hash : e.hash.replace(/[^0-9a-f]/g, '').slice(0, 64)
   const ver = e.version ? `@${e.version.replace(/[^\w.+-]/g, '_')}` : ''
   const dir = e.kind === 'bundle' ? 'bundles' : e.kind === 'skill' ? 'skills' : 'configs'
-  return `${dir}/${e.name.replace(/[^\w.@+-]+/g, '_')}${ver}-${hash}.zip`
+  // scoped 名 @org/pkg 的 '/' 会凭空造出一层远端目录（且 manifest 会判路径越界）：压平为 @org_pkg
+  const safeName = e.name.replace(/[^\w.@+-]/g, '_')
+  return `${dir}/${safeName}${ver}-${hash}.zip`
 }
 
 // ---------- 远端清单结构校验（信任边界：服务器数据入库前必查） ----------
